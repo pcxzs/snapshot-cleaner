@@ -300,6 +300,9 @@ and a purge takes its snapshots' cached listings with it.
 - btrfs only. Other filesystems are detected and refused.
 - Whole-snapshot deletion is out of scope; that is what snapshot managers do.
 - Files smaller than `--min-size` (default 50M) are ignored.
+- `--exclude` matches the path relative to the subvolume root, the file's own
+  name, or any directory above it, so `cache` and `cache/*` both skip the whole
+  subtree.
 - `--exclude` filters the report; it no longer speeds the scan up, because the
   tree sweep reads whole metadata leaves and cannot skip a subtree. It still
   prunes on the `readdir` walk, where that was the only thing it saved.

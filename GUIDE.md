@@ -319,7 +319,7 @@ Finds and ranks pinned files. Read-only. Writes its results to a state file that
 | `--min-size SIZE` | `50M` | Ignore smaller files. Accepts `50M`, `1.5G`, `10MiB`, `2GB`, `1024`. |
 | `--top N` | `25` | Rows to display. `0` shows all. |
 | `--include-replaced` | off | Also report files still present live whose *older* content is pinned. |
-| `--exclude GLOB` | | Skip matching paths. Repeatable. |
+| `--exclude GLOB` | | Skip matching paths. Matches the path relative to the subvolume root, the file's name, or any directory above it - so `cache` and `cache/*` both skip the whole subtree. Repeatable. |
 | `--cost-limit N` | `200` | Measure at most this many candidates. `0` measures all. |
 | `--workers N` | auto | Snapshots walked in parallel. Auto is `min(NumCPU, 8)`. |
 | `--json` | off | Machine-readable output. |

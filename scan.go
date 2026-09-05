@@ -481,6 +481,15 @@ func readdirWalk(root string, floor uint64, prune []string) ([]manifestEntry, bo
 	return out, complete, nil
 }
 
+// excluded reports whether rel is filtered out by any --exclude pattern.
+//
+// A pattern is matched against the path relative to the subvolume root, against
+// the file's own name, and against every ancestor directory of the path - both
+// the ancestor's full relative path and its bare name. The ancestors matter
+// because filepath.Match's * never crosses a /, so "deep/*" alone matches
+// "deep/nested" but not "deep/nested/buried.bin", and "deep" matches neither.
+// Without the ancestor walk no pattern could exclude a subtree, which is the
+// thing people reach for --exclude to do, and it would fail silently.
 func excluded(rel, base string, patterns []string) bool {
 	for _, p := range patterns {
 		if ok, _ := filepath.Match(p, rel); ok {
@@ -488,6 +497,14 @@ func excluded(rel, base string, patterns []string) bool {
 		}
 		if ok, _ := filepath.Match(p, base); ok {
 			return true
+		}
+		for dir := filepath.Dir(rel); dir != "." && dir != "/" && dir != ""; dir = filepath.Dir(dir) {
+			if ok, _ := filepath.Match(p, dir); ok {
+				return true
+			}
+			if ok, _ := filepath.Match(p, filepath.Base(dir)); ok {
+				return true
+			}
 		}
 	}
 	return false

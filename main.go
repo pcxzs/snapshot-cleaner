@@ -520,7 +520,7 @@ func cmdScan(args []string) error {
 	workers := fs.Int("workers", 0, "snapshots to walk in parallel (0 chooses based on CPU count)")
 	asJSON := fs.Bool("json", false, "emit JSON")
 	var excludes multiFlag
-	fs.Var(&excludes, "exclude", "glob to skip (repeatable)")
+	fs.Var(&excludes, "exclude", "glob to skip; matches a path, a name, or any directory above it (repeatable)")
 	if err := fs.Parse(permuteArgs(fs, args)); err != nil {
 		return err
 	}

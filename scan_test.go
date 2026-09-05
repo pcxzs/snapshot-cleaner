@@ -126,6 +126,60 @@ func TestFilterDifferingDropsIdenticalCopies(t *testing.T) {
 	}
 }
 
+func TestExcludedMatchesSubtrees(t *testing.T) {
+	// filepath.Match's * never crosses a /, so a pattern only reaches a nested
+	// file through the ancestor walk. Without it, --exclude silently kept
+	// everything below the first level.
+	cases := []struct {
+		name    string
+		pattern string
+		rel     string
+		want    bool
+	}{
+		{"glob one level down", "deep/*", "deep/buried.bin", true},
+		{"glob two levels down", "deep/*", "deep/nested/buried.bin", true},
+		{"glob many levels down", "deep/*", "deep/a/b/c/buried.bin", true},
+		{"bare directory name", "deep", "deep/nested/buried.bin", true},
+		{"intermediate directory", "nested", "deep/nested/buried.bin", true},
+		{"full path", "deep/nested/buried.bin", "deep/nested/buried.bin", true},
+		{"basename glob", "*.iso", "downloads/junk.iso", true},
+		{"basename glob at root", "*.iso", "junk.iso", true},
+		{"wildcard directory", "*/nested", "deep/nested/buried.bin", true},
+		{"unrelated directory", "shallow", "deep/nested/buried.bin", false},
+		{"unrelated glob", "*.qcow2", "deep/nested/buried.bin", false},
+		{"partial name is not a match", "dee", "deep/nested/buried.bin", false},
+		{"sibling of the target", "deep/other/*", "deep/nested/buried.bin", false},
+		{"no patterns", "", "deep/nested/buried.bin", false},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var patterns []string
+			if tc.pattern != "" {
+				patterns = []string{tc.pattern}
+			}
+			got := excluded(tc.rel, filepath.Base(tc.rel), patterns)
+			if got != tc.want {
+				t.Errorf("excluded(%q, pattern %q) = %v, want %v",
+					tc.rel, tc.pattern, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestExcludedMatchesAnyPattern(t *testing.T) {
+	patterns := []string{"*.tmp", "deep/*"}
+	if !excluded("deep/nested/buried.bin", "buried.bin", patterns) {
+		t.Error("second pattern must still be consulted")
+	}
+	if !excluded("scratch.tmp", "scratch.tmp", patterns) {
+		t.Error("first pattern must still be consulted")
+	}
+	if excluded("keep/me.iso", "me.iso", patterns) {
+		t.Error("a path matching neither pattern must survive")
+	}
+}
+
 func TestSelectScope(t *testing.T) {
 	pairs := []Pair{
 		{Name: "@home", Live: "/home"},
