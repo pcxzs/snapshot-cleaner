@@ -1,0 +1,11 @@
+# Build output
+/snapshot-cleaner
+/snapshot-cleaner-debug
+/dist/
+
+# Test binaries and integration logs (see `make integration`)
+/*.test
+/integration*.log
+
+# Local, machine-specific tool settings
+/.claude/settings.local.json

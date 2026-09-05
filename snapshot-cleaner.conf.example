@@ -1,0 +1,27 @@
+# snapshot-cleaner configuration
+#
+# Install at /etc/snapshot-cleaner.conf, or $XDG_CONFIG_HOME/snapshot-cleaner/config.
+# Every setting here is optional: with no config at all the tool autodetects
+# Timeshift, snapper and btrbk layouts. This file is the escape hatch for
+# layouts autodetection cannot infer. Command-line flags override it.
+
+# Ignore files smaller than this. Accepts 50M, 1.5G, 1024, 10MiB, 2GB.
+# min-size = 100M
+
+# Size floor recorded in the scan cache. A scan reuses a cached listing only if
+# its floor is at or below the scan's --min-size, so a lower floor here means
+# more future scans hit the cache. It costs cache bytes, not scan time: the walk
+# visits every file regardless of any threshold. Default 1M.
+# cache-min-size = 1M
+
+# Force a single provider instead of trying all of them.
+# One of: timeshift, snapper, btrbk
+# provider = snapper
+
+# Declare live/snapshot pairs by hand, as "<live subvolume> : <snapshot dir>".
+# The snapshot directory is the one whose immediate children are the snapshot
+# subvolumes. Repeat the line for each pair. Declaring any pair here disables
+# autodetection entirely.
+#
+# pair = /home : /mnt/btr/snapshots/home
+# pair = /     : /mnt/btr/snapshots/root

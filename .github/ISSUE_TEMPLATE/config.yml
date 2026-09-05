@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Documentation
+    url: https://github.com/pcxzs/snapshot-cleaner/blob/main/GUIDE.md
+    about: The full manual — how the space figure is computed, every flag, purge safety, supported layouts, troubleshooting and recovery.
+  - name: Report a vulnerability or data loss
+    url: https://github.com/pcxzs/snapshot-cleaner/security/advisories/new
+    about: Please report these privately rather than in a public issue.
