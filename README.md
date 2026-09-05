@@ -7,37 +7,9 @@
 Find and reclaim disk space held by files that only exist in btrfs snapshots.
 
 > [!WARNING]
-> **This tool permanently deletes data, and it runs as root.**
->
-> To do its job it temporarily clears the read-only flag on your btrfs
-> snapshots, unlinks files inside them, and restores the flag. That means:
->
-> - **Deletions cannot be undone.** There is no trash, no staging area and no
->   rollback. Once a file is unlinked from every snapshot holding it, the only
->   remaining copy is whatever backup you made yourself. `journal.jsonl` records
->   what was removed, but it cannot bring anything back.
-> - **Your snapshots stop being complete.** A purged snapshot can no longer
->   restore the purged file, and your snapshot manager will not know anything
->   changed. A restore you assumed was possible may not be.
-> - **Your snapshots are briefly writable.** A crash, power loss, kernel bug or
->   `SIGKILL` at the wrong moment can leave a snapshot read-write. The tool
->   restores the flag from a deferred call, from its signal handler, and then
->   verifies it — but it cannot defend against every failure, and a snapshot
->   left writable can be modified by anything else on the system.
-> - **Bugs here corrupt data, not pixels.** This is a young project with limited
->   real-world exposure. It manipulates btrfs through raw ioctls. A defect in
->   path resolution, target validation or flag restoration could damage or
->   destroy data well beyond the file you selected.
->
-> **Have a backup that is not on this filesystem, and that this tool cannot
-> reach, before you use `--apply`.** Snapshots are not backups: they live on the
-> same disk, and this tool edits them. Try it on non-critical data first, read
-> the dry run in full every time, and treat anything you cannot afford to lose
-> as something to leave alone.
->
-> Provided with **absolutely no warranty**, to the full extent permitted by the
-> [GPL-3.0](LICENSE). You accept all risk of data loss or corruption. See
-> [Disclaimer](#disclaimer).
+> This tool runs as root and permanently deletes files from inside your
+> snapshots. Deletions cannot be undone — keep a backup off this filesystem, and
+> read the [disclaimer](#disclaimer) before using `--apply`.
 
 ## The problem
 
@@ -352,6 +324,9 @@ In plain terms:
   extent accounting and can be wrong or unavailable; estimates are marked `~`
   and unknowns print `?`. Free space after a purge may differ from what was
   predicted.
+- This is a **young project with limited real-world exposure**, manipulating
+  btrfs through raw ioctls. A defect in path resolution, target validation or
+  read-only flag restoration could affect data beyond the file you selected.
 - No guarantee is made that it is correct on your kernel version, your btrfs
   layout, your snapshot manager, or a filesystem in an unusual state
   (`ENOSPC`, an unfinished balance or device replace, quotas enabled, a
