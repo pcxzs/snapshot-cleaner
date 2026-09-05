@@ -6,6 +6,39 @@
 
 Find and reclaim disk space held by files that only exist in btrfs snapshots.
 
+> [!WARNING]
+> **This tool permanently deletes data, and it runs as root.**
+>
+> To do its job it temporarily clears the read-only flag on your btrfs
+> snapshots, unlinks files inside them, and restores the flag. That means:
+>
+> - **Deletions cannot be undone.** There is no trash, no staging area and no
+>   rollback. Once a file is unlinked from every snapshot holding it, the only
+>   remaining copy is whatever backup you made yourself. `journal.jsonl` records
+>   what was removed, but it cannot bring anything back.
+> - **Your snapshots stop being complete.** A purged snapshot can no longer
+>   restore the purged file, and your snapshot manager will not know anything
+>   changed. A restore you assumed was possible may not be.
+> - **Your snapshots are briefly writable.** A crash, power loss, kernel bug or
+>   `SIGKILL` at the wrong moment can leave a snapshot read-write. The tool
+>   restores the flag from a deferred call, from its signal handler, and then
+>   verifies it — but it cannot defend against every failure, and a snapshot
+>   left writable can be modified by anything else on the system.
+> - **Bugs here corrupt data, not pixels.** This is a young project with limited
+>   real-world exposure. It manipulates btrfs through raw ioctls. A defect in
+>   path resolution, target validation or flag restoration could damage or
+>   destroy data well beyond the file you selected.
+>
+> **Have a backup that is not on this filesystem, and that this tool cannot
+> reach, before you use `--apply`.** Snapshots are not backups: they live on the
+> same disk, and this tool edits them. Try it on non-critical data first, read
+> the dry run in full every time, and treat anything you cannot afford to lose
+> as something to leave alone.
+>
+> Provided with **absolutely no warranty**, to the full extent permitted by the
+> [GPL-3.0](LICENSE). You accept all risk of data loss or corruption. See
+> [Disclaimer](#disclaimer).
+
 ## The problem
 
 On a btrfs system with snapshots, deleting a large file frees nothing. Every
@@ -298,6 +331,35 @@ and a purge takes its snapshots' cached listings with it.
 - `--exclude` filters the report; it no longer speeds the scan up, because the
   tree sweep reads whole metadata leaves and cannot skip a subtree. It still
   prunes on the `readdir` walk, where that was the only thing it saved.
+
+## Disclaimer
+
+`snapshot-cleaner` is free software provided **"as is", without warranty of any
+kind**, express or implied, including but not limited to the warranties of
+merchantability, fitness for a particular purpose and non-infringement. See
+sections 15 and 16 of the [GPL-3.0](LICENSE) for the full text.
+
+In plain terms:
+
+- The authors and contributors are **not liable for any data loss, data
+  corruption, filesystem damage, downtime or any other harm** arising from use
+  of this software, whether or not it behaved as documented.
+- Running it is **entirely at your own risk**, and the risk is real: it executes
+  as root, modifies snapshot subvolume flags, and irreversibly unlinks files.
+- **You are responsible for your own backups** and for verifying that they
+  restore. Nothing this tool prints is a substitute for one.
+- Its output is a **best-effort estimate**. Reclaim figures come from btrfs
+  extent accounting and can be wrong or unavailable; estimates are marked `~`
+  and unknowns print `?`. Free space after a purge may differ from what was
+  predicted.
+- No guarantee is made that it is correct on your kernel version, your btrfs
+  layout, your snapshot manager, or a filesystem in an unusual state
+  (`ENOSPC`, an unfinished balance or device replace, quotas enabled, a
+  read-only or degraded mount, send/receive in flight).
+
+If you are not prepared to lose the data on the filesystem you point this at,
+do not use `--apply`. `scan`, `snapshots`, `doctor`, `journal` and dry-run
+`purge` only read, and are safe to explore with.
 
 ## Contributing
 

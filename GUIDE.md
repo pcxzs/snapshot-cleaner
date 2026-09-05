@@ -3,6 +3,17 @@
 Reclaim disk space held by files that were deleted from a btrfs filesystem but
 are still pinned by snapshots.
 
+> [!WARNING]
+> **This tool runs as root and permanently deletes data.** It clears the
+> read-only flag on your snapshots, unlinks files inside them, and restores the
+> flag. Deletions cannot be undone, a purged snapshot can no longer restore the
+> purged file, and a crash at the wrong moment can leave a snapshot writable.
+> Have a backup that is not on this filesystem before using `--apply`.
+>
+> Provided with **absolutely no warranty**; you accept all risk of data loss or
+> corruption. See the full [disclaimer](README.md#disclaimer) and
+> [§8 Purging safely](#8-purging-safely).
+
 ---
 
 ## Table of contents
