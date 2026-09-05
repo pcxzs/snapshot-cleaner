@@ -7,4 +7,4 @@ require (
 	golang.org/x/term v0.44.0
 )
 
-require go.etcd.io/bbolt v1.4.3
+require go.etcd.io/bbolt v1.5.0
