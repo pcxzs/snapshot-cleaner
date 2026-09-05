@@ -38,7 +38,9 @@ integration: $(BINARY)-integration.test
 	@echo
 	@echo "Full log: $(CURDIR)/integration.log"
 
-$(BINARY)-integration.test:
+# Depends on every source file: without prerequisites make would keep reusing a
+# stale binary and silently test code you already changed.
+$(BINARY)-integration.test: $(wildcard *.go) go.mod go.sum
 	$(GO) test -c -o $@ .
 
 vet:
