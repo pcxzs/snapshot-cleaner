@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -70,8 +71,8 @@ func BuildPlan(st *ScanState, ids []int, partial bool) (*PurgePlan, error) {
 		}
 	}
 
-	Infof("plan", "building plan for ids=%v partial=%v from a scan of %s",
-		ids, partial, st.ScannedAt.Format(time.RFC3339))
+	Infof("plan", "building plan for ids=%s partial=%v from a scan of %s",
+		summariseIDs(ids), partial, st.ScannedAt.Format(time.RFC3339))
 	plan := &PurgePlan{Partial: partial}
 	for _, id := range ids {
 		cand, ok := st.Find(id)
@@ -170,6 +171,25 @@ func BuildPlan(st *ScanState, ids []int, partial bool) (*PurgePlan, error) {
 		return plan.Targets[i].Copy.Path < plan.Targets[j].Copy.Path
 	})
 	return plan, nil
+}
+
+// summariseIDs renders a selection for the log.
+//
+// A folder purge expands to one id per file, so the raw slice is a single
+// twenty-kilobyte line that pushes everything worth reading off the screen.
+// Every id still appears in the log on its own line as it is validated; this
+// is the header, and a header should be readable.
+func summariseIDs(ids []int) string {
+	const inline = 20
+	if len(ids) <= inline {
+		return fmt.Sprint(ids)
+	}
+	head := make([]string, 0, inline)
+	for _, id := range ids[:inline] {
+		head = append(head, strconv.Itoa(id))
+	}
+	return fmt.Sprintf("[%s ... %d] (%d ids)",
+		strings.Join(head, " "), ids[len(ids)-1], len(ids))
 }
 
 // RenderPlan prints exactly what will be removed.

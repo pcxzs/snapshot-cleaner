@@ -321,3 +321,26 @@ func truncateForTest(s string) string {
 	}
 	return s
 }
+
+// A folder purge expands to one id per file, and the raw slice would be a
+// single twenty-kilobyte log line that buries everything around it.
+func TestSummariseIDsKeepsTheLogHeaderReadable(t *testing.T) {
+	short := []int{1, 2, 3}
+	if got := summariseIDs(short); got != "[1 2 3]" {
+		t.Errorf("summariseIDs(%v) = %q, want the ids themselves", short, got)
+	}
+
+	long := make([]int, 3000)
+	for i := range long {
+		long[i] = i + 1
+	}
+	got := summariseIDs(long)
+	if len(got) > 120 {
+		t.Errorf("summary is %d chars, still too long to read: %q", len(got), got)
+	}
+	for _, want := range []string{"1 2 3", "3000", "(3000 ids)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary %q is missing %q", got, want)
+		}
+	}
+}

@@ -436,18 +436,22 @@ func ExpandFolder(f *Folder, pairs []Pair, nextID int) ([]Candidate, []Skip, err
 	livePath := filepath.Join(live, f.RelPath)
 	if f.Kind == FolderDeleted {
 		if _, err := os.Lstat(livePath); err == nil {
+			Warnf("plan", "folder %s: %s exists on the live filesystem again; refusing", f.Label(), livePath)
 			return nil, []Skip{{f.RelPath, "directory exists on the live filesystem again"}}, nil
 		}
+		Debugf("plan", "folder %s: confirmed absent from live at %s", f.Label(), livePath)
 	}
 
 	var (
-		skips   []Skip
-		byPath  = map[string][]Copy{}
-		holders int
+		skips    []Skip
+		byPath   = map[string][]Copy{}
+		holders  int
+		returned int
 	)
 	for _, h := range f.Holders {
 		snap, ok := snaps[h.SnapshotID]
 		if !ok {
+			Infof("plan", "folder %s: snapshot %s is gone (rotated out)", f.Label(), h.SnapshotID)
 			skips = append(skips, Skip{h.SnapshotID, "snapshot is no longer present (rotated out)"})
 			continue
 		}
@@ -455,6 +459,8 @@ func ExpandFolder(f *Folder, pairs []Pair, nextID int) ([]Candidate, []Skip, err
 		// it the rebuilt list could differ from the one that was measured and
 		// shown, and the user would be approving a different thing.
 		if h.CTransID != 0 && snap.CTransID != 0 && snap.CTransID != h.CTransID {
+			Warnf("plan", "folder %s: snapshot %s changed since the scan (ctransid %d -> %d); refusing it",
+				f.Label(), snap.ID, h.CTransID, snap.CTransID)
 			skips = append(skips, Skip{snap.ID,
 				fmt.Sprintf("snapshot changed since the scan (ctransid %d -> %d); rescan before purging this folder",
 					h.CTransID, snap.CTransID)})
@@ -462,6 +468,7 @@ func ExpandFolder(f *Folder, pairs []Pair, nextID int) ([]Candidate, []Skip, err
 		}
 		root := filepath.Join(snap.Root, f.RelPath)
 		if _, err := os.Lstat(root); err != nil {
+			Infof("plan", "folder %s: not present in snapshot %s (%v)", f.Label(), snap.ID, err)
 			skips = append(skips, Skip{root, "folder is not in this snapshot any more"})
 			continue
 		}
@@ -489,6 +496,8 @@ func ExpandFolder(f *Folder, pairs []Pair, nextID int) ([]Candidate, []Skip, err
 		}
 	}
 	if holders == 0 {
+		Warnf("plan", "folder %s: none of its %d recorded snapshot(s) are usable; nothing to do",
+			f.Label(), len(f.Holders))
 		return nil, skips, nil
 	}
 
@@ -519,6 +528,8 @@ func ExpandFolder(f *Folder, pairs []Pair, nextID int) ([]Candidate, []Skip, err
 		// A file that is back on the live tree is no longer pinned by these
 		// snapshots alone, and was not part of what the folder promised.
 		if _, err := os.Lstat(filepath.Join(live, rel)); err == nil {
+			Debugf("plan", "folder %s: %s is back on the live tree; leaving it alone", f.Label(), rel)
+			returned++
 			skips = append(skips, Skip{rel, "file exists on the live filesystem again"})
 			continue
 		}
@@ -553,7 +564,8 @@ func ExpandFolder(f *Folder, pairs []Pair, nextID int) ([]Candidate, []Skip, err
 		})
 		nextID++
 	}
-	Infof("plan", "folder %s (%s): rebuilt %d file(s) across %d snapshot(s), %d skip(s)",
-		f.Label(), f.RelPath, len(out), holders, len(skips))
+	Infof("plan", "folder %s (%s): rebuilt %d file(s) across %d snapshot(s) of %d recorded, "+
+		"%d back on the live tree, %d skip(s) in total",
+		f.Label(), f.RelPath, len(out), holders, len(f.Holders), returned, len(skips))
 	return out, skips, nil
 }

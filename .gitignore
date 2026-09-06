@@ -3,6 +3,6 @@
 /snapshot-cleaner-debug
 /dist/
 
-# Test binaries and integration logs (see `make integration`)
+# Test binaries, and any log a run is pointed at with --log-file
 /*.test
-/integration*.log
+/*.log

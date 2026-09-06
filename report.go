@@ -255,7 +255,7 @@ func RenderFolderTable(w io.Writer, st *ScanState, top int, showAll bool) {
 // couple of new promises the file view does not, and they belong next to the
 // numbers rather than only in the documentation.
 func renderFolderNotes(w io.Writer, st *ScanState, shown []Folder) {
-	sampled, unmeasured, thinned := 0, 0, 0
+	sampled, unmeasured, thinned, overApparent := 0, 0, 0, 0
 	for _, f := range shown {
 		switch {
 		case f.Usage.Method == MethodNone:
@@ -265,6 +265,13 @@ func renderFolderNotes(w io.Writer, st *ScanState, shown []Folder) {
 		}
 		if f.Kind == FolderThinned {
 			thinned++
+		}
+		// Only count rows where the reader can see the difference, as the file
+		// view does: a note claiming rows exceed their apparent size reads as
+		// wrong when the two columns are formatted identically.
+		if f.Usage.Method != MethodNone && f.Usage.Bytes > f.Apparent &&
+			FormatBytes(f.Usage.Bytes) != FormatBytes(f.Apparent) {
+			overApparent++
 		}
 	}
 
@@ -277,6 +284,14 @@ func renderFolderNotes(w io.Writer, st *ScanState, shown []Folder) {
 	if thinned > 0 {
 		fmt.Fprintf(w, "  %d row(s) marked 'thinned' still exist live; only files deleted out of them\n", thinned)
 		fmt.Fprintln(w, "  are counted, and purging one leaves the live directory untouched.")
+	}
+	if overApparent > 0 {
+		// Far more common here than in the file view: every one of a folder's
+		// thousands of files rounds up to a whole block, and the rounding adds
+		// up to something visible where on a single file it never is.
+		fmt.Fprintf(w, "  %d row(s) show RECLAIM above APPARENT. Each file occupies whole blocks, so\n", overApparent)
+		fmt.Fprintln(w, "  a folder of many small files allocates more than their sizes add up to, and")
+		fmt.Fprintln(w, "  all of it is freed. Files rewritten in place hold extra extents the same way.")
 	}
 	if sampled > 0 {
 		fmt.Fprintf(w, "  %d row(s) were too large to open file by file, so they were measured from\n", sampled)

@@ -351,3 +351,37 @@ func TestRelocateRewritesFolderHolders(t *testing.T) {
 		t.Errorf("live path not refreshed: live=%q livePath=%q", f.Live, f.LivePath)
 	}
 }
+
+// A folder of many small files routinely reclaims more than the file sizes add
+// up to, because each file occupies whole blocks. Unexplained, that reads as a
+// bug in the tool rather than as how the filesystem works.
+func TestRenderFolderTableExplainsReclaimAboveApparent(t *testing.T) {
+	st := folderState()
+	st.Folders[0].Apparent = 83 << 20
+	st.Folders[0].Usage = SetUsage{Bytes: 89 << 20, Method: MethodTreeSearch, Exact: true}
+
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, st, 0, true)
+	out := buf.String()
+	if !strings.Contains(out, "RECLAIM above APPARENT") {
+		t.Errorf("the notes must explain a row that reclaims more than its apparent size:\n%s", out)
+	}
+	if !strings.Contains(out, "whole blocks") {
+		t.Errorf("the explanation must give the reason:\n%s", out)
+	}
+}
+
+// The note must not fire when the two columns render identically, or it
+// contradicts the table it is explaining.
+func TestRenderFolderTableStaysQuietOnInvisibleRounding(t *testing.T) {
+	st := folderState()
+	st.Folders[0].Apparent = 89 << 20
+	st.Folders[0].Usage = SetUsage{Bytes: 89<<20 + 512, Method: MethodTreeSearch, Exact: true}
+	st.Folders[1].Usage = SetUsage{Bytes: 1, Method: MethodTreeSearch, Exact: true}
+
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, st, 0, true)
+	if out := buf.String(); strings.Contains(out, "RECLAIM above APPARENT") {
+		t.Errorf("the note fired on a difference the reader cannot see:\n%s", out)
+	}
+}
