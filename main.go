@@ -49,7 +49,7 @@ USAGE
 COMMANDS
   doctor      Show what was detected and what the tool can do here. Read-only.
   snapshots   List the detected live/snapshot pairs.
-  scan        Find and rank pinned files. Read-only.
+  scan        Find and rank pinned files, or whole folders. Read-only.
   purge       Remove selected files from the snapshots holding them.
   cache       Inspect, prune or clear the scan cache.
   journal     Show past deletions.
@@ -57,11 +57,19 @@ COMMANDS
 
 Run "%[1]s <command> -h" for a command's flags.
 
+TWO VIEWS
+  By default scan ranks individual files, which finds the big ones. A deleted
+  directory of a hundred thousand small files pins just as much space and no
+  single file in it is large, so "scan --folders" adds them up and ranks the
+  directories instead. Folder rows are selected as F1, F2 and so on.
+
 EXAMPLES
   sudo %[1]s doctor
   sudo %[1]s scan --min-size 100M
-  sudo %[1]s purge 1,3,7-9          # dry run
+  sudo %[1]s scan --folders            # rank directories, not files
+  sudo %[1]s purge 1,3,7-9             # dry run
   sudo %[1]s purge 1,3,7-9 --apply
+  sudo %[1]s purge F2 --apply          # a whole folder
   sudo %[1]s purge --interactive --apply
 `
 
@@ -513,12 +521,15 @@ func cmdScan(args []string) error {
 	c := &commonFlags{}
 	c.register(fs)
 	scope := fs.String("scope", "all", "which pairs to scan: all, or a comma-separated list of names")
-	minSize := fs.String("min-size", "50M", "ignore files smaller than this")
+	minSize := fs.String("min-size", "50M", "ignore files smaller than this (with --folders, folders smaller than this)")
 	top := fs.Int("top", 25, "show only the top N rows (0 for all)")
 	includeReplaced := fs.Bool("include-replaced", false, "also report files still present live but whose older content is pinned")
 	costLimit := fs.Int("cost-limit", 200, "measure at most this many candidates (0 for all)")
 	workers := fs.Int("workers", 0, "snapshots to walk in parallel (0 chooses based on CPU count)")
 	asJSON := fs.Bool("json", false, "emit JSON")
+	folders := fs.Bool("folders", false, "rank whole folders instead of individual files")
+	fileMinSize := fs.String("file-min-size", "0", "with --folders, ignore files smaller than this when adding them up")
+	folderSample := fs.Int("folder-sample", DefaultFolderSample, "with --folders, measure at most this many file copies per folder (0 for all)")
 	var excludes multiFlag
 	fs.Var(&excludes, "exclude", "glob to skip; matches a path, a name, or any directory above it (repeatable)")
 	if err := fs.Parse(permuteArgs(fs, args)); err != nil {
@@ -526,6 +537,10 @@ func cmdScan(args []string) error {
 	}
 
 	min, err := ParseSize(*minSize)
+	if err != nil {
+		return err
+	}
+	fileMin, err := ParseSize(*fileMinSize)
 	if err != nil {
 		return err
 	}
@@ -537,6 +552,16 @@ func cmdScan(args []string) error {
 		if min, err = ParseSize(a.cfg.MinSize); err != nil {
 			return err
 		}
+	}
+
+	// In folder view --min-size is the threshold on the folder, not on the
+	// files inside it: a deleted tree of 30 KiB files is exactly what the view
+	// exists to surface, so the per-file floor drops to --file-min-size. That
+	// is what makes the walk see them at all, and it is the flag to raise if a
+	// scan of a very large filesystem needs bounding.
+	folderMin := uint64(0)
+	if *folders {
+		folderMin, min = min, fileMin
 	}
 
 	pairs, err := a.pairs()
@@ -581,6 +606,9 @@ func cmdScan(args []string) error {
 		Cache:           cache,
 		CacheFloor:      floor,
 		Walk:            walk,
+		Folders:         *folders,
+		FolderMinSize:   folderMin,
+		FolderSample:    *folderSample,
 	}
 	if c.gentle && *workers <= 0 {
 		opts.Workers = 2
@@ -590,11 +618,18 @@ func cmdScan(args []string) error {
 		if w <= 0 {
 			w = DefaultWorkers()
 		}
-		fmt.Fprintf(os.Stderr, "Scanning %d pair(s) for files of %s or more (%d workers, %s%s)...\n",
-			len(pairs), FormatBytes(min), w, c.priority(), cacheNote(cache))
+		what := fmt.Sprintf("files of %s or more", FormatBytes(min))
+		if *folders {
+			what = fmt.Sprintf("folders of %s or more", FormatBytes(folderMin))
+			if fileMin > 0 {
+				what += fmt.Sprintf(", counting files of %s or more", FormatBytes(fileMin))
+			}
+		}
+		fmt.Fprintf(os.Stderr, "Scanning %d pair(s) for %s (%d workers, %s%s)...\n",
+			len(pairs), what, w, c.priority(), cacheNote(cache))
 	}
 
-	cands, err := Scan(pairs, opts)
+	res, err := Scan(pairs, opts)
 	if err != nil {
 		return err
 	}
@@ -611,20 +646,18 @@ func cmdScan(args []string) error {
 		Debugf("cache", "GC removed %d stale entry/entries", n)
 	}
 
-	costed := *costLimit
-	if costed <= 0 || costed > len(cands) {
-		costed = len(cands)
-	}
 	free, _ := FreeBytes(pairs[0].Live)
 	fsid, _ := FilesystemID(pairs[0].Live)
 	st := &ScanState{
-		ScannedAt:    time.Now(),
-		FilesystemID: fsid,
-		MinSize:      min,
-		Costed:       costed,
-		FreeBytes:    free,
-		Pairs:        pairs,
-		Candidates:   cands,
+		ScannedAt:     time.Now(),
+		FilesystemID:  fsid,
+		MinSize:       min,
+		Costed:        res.Costed,
+		FreeBytes:     free,
+		Pairs:         pairs,
+		Candidates:    res.Candidates,
+		Folders:       res.Folders,
+		FolderMinSize: folderMin,
 	}
 	if err := SaveState(a.dirs.StateFile(), st); err != nil {
 		Errorf("scan", "saving state failed: %v", err)
@@ -635,12 +668,23 @@ func cmdScan(args []string) error {
 	if *asJSON {
 		return RenderJSON(os.Stdout, st)
 	}
-	RenderTable(os.Stdout, st, *top, false)
+	hint := ""
+	if *folders {
+		RenderFolderTable(os.Stdout, st, *top, false)
+		if len(res.Folders) > 0 {
+			hint = "F1"
+		}
+	} else {
+		RenderTable(os.Stdout, st, *top, false)
+		if len(res.Candidates) > 0 {
+			hint = "1"
+		}
+	}
 	if line := cacheSummary(cache); line != "" {
 		fmt.Fprintf(os.Stderr, "\n%s\n", line)
 	}
-	if len(cands) > 0 {
-		fmt.Printf("\nTo remove one, review the dry run first:\n  sudo %s purge 1\n", appName)
+	if hint != "" {
+		fmt.Printf("\nTo remove one, review the dry run first:\n  sudo %s purge %s\n", appName, hint)
 	}
 	return nil
 }
@@ -684,10 +728,47 @@ func cmdPurge(args []string) error {
 			age.Round(time.Hour))
 	}
 
-	var ids []int
+	var (
+		ids      []int
+		chosen   []Folder
+		preSkips []Skip
+	)
+	// A folder's members were never written to the state file, so they are
+	// rebuilt from the snapshots now and then validated one by one like any
+	// other candidate.
+	selectFolders := func(want []int) error {
+		expanded, folders, skips, err := expandFolderIDs(st, want)
+		if err != nil {
+			return err
+		}
+		ids = append(ids, expanded...)
+		chosen = append(chosen, folders...)
+		preSkips = append(preSkips, skips...)
+		return nil
+	}
+
 	switch {
 	case *interactive:
-		if ids, err = RunPicker(st.Candidates); err != nil {
+		// The picker shows whichever view the scan produced. A folder scan
+		// keeps no candidates and a file scan has no rollups, so there is
+		// nothing to switch between within one saved scan.
+		if st.FolderView() {
+			picked, err := RunPicker(FolderRows(st.Folders),
+				"Select folders to remove from their snapshots")
+			if err != nil {
+				return err
+			}
+			if len(picked) == 0 {
+				fmt.Println("Nothing selected.")
+				return nil
+			}
+			if err := selectFolders(picked); err != nil {
+				return err
+			}
+			break
+		}
+		if ids, err = RunPicker(CandidateRows(st.Candidates),
+			"Select files to remove from their snapshots"); err != nil {
 			return err
 		}
 		if len(ids) == 0 {
@@ -695,17 +776,29 @@ func cmdPurge(args []string) error {
 			return nil
 		}
 	case fs.NArg() > 0:
-		if ids, err = ParseIDs(fs.Args()); err != nil {
+		sel, err := ParseSelection(fs.Args())
+		if err != nil {
 			return err
 		}
+		ids = sel.Files
+		if len(sel.Folders) > 0 {
+			if err := selectFolders(sel.Folders); err != nil {
+				return err
+			}
+		}
 	default:
-		return fmt.Errorf("give ids to purge (e.g. `purge 1,3,7-9`) or use --interactive")
+		return fmt.Errorf("give ids to purge (e.g. `purge 1,3,7-9`, or `purge F2` for a folder) or use --interactive")
+	}
+	if len(ids) == 0 && len(preSkips) == 0 {
+		return fmt.Errorf("nothing selected")
 	}
 
 	plan, err := BuildPlan(st, ids, *partial)
 	if err != nil {
 		return err
 	}
+	plan.Folders = chosen
+	plan.Skips = append(preSkips, plan.Skips...)
 	RenderPlan(os.Stdout, plan, *apply)
 	if len(plan.Targets) == 0 {
 		return nil
@@ -782,6 +875,44 @@ func cmdPurge(args []string) error {
 	// explicitly does not depend on that reasoning holding.
 	dropPurgedFromCache(a, plan)
 	return execErr
+}
+
+// expandFolderIDs turns the selected folder rows into candidates the ordinary
+// purge plan can validate, appending them to the state's candidate list so
+// BuildPlan finds them by id like any other row.
+func expandFolderIDs(st *ScanState, want []int) (ids []int, chosen []Folder, skips []Skip, err error) {
+	if len(st.Folders) == 0 {
+		return nil, nil, nil, fmt.Errorf("the last scan did not rank folders; "+
+			"re-run `%s scan --folders` to select by folder id", appName)
+	}
+	next := 1
+	for _, c := range st.Candidates {
+		if c.ID >= next {
+			next = c.ID + 1
+		}
+	}
+	for _, id := range want {
+		f, ok := st.FindFolder(id)
+		if !ok {
+			skips = append(skips, Skip{fmt.Sprintf("id F%d", id), "no such folder in the last scan"})
+			continue
+		}
+		cands, fskips, err := ExpandFolder(f, st.Pairs, next)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		skips = append(skips, fskips...)
+		if len(cands) == 0 {
+			continue
+		}
+		for _, c := range cands {
+			ids = append(ids, c.ID)
+		}
+		st.Candidates = append(st.Candidates, cands...)
+		chosen = append(chosen, *f)
+		next += len(cands)
+	}
+	return ids, chosen, skips, nil
 }
 
 func cmdJournal(args []string) error {

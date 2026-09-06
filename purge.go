@@ -34,7 +34,20 @@ type PurgePlan struct {
 	Skips     []Skip
 	Estimated uint64
 	Partial   bool
+
+	// Folders records the rollups this plan was expanded from, so the dry run
+	// can be reviewed at the level the user selected at rather than as tens of
+	// thousands of individual files.
+	Folders []Folder
 }
+
+// planListLimit bounds how many files the dry run itemises.
+//
+// The dry run exists to be read before anything is removed, and a folder purge
+// can cover forty thousand files; printing them all is not review, it is a
+// scrollback flood that hides the summary underneath it. The full list is
+// always written to the log at info level, so nothing is lost.
+const planListLimit = 50
 
 // ByCandidate groups the plan for display and for the "all holders or none"
 // rule that makes a purge actually free space.
@@ -185,7 +198,30 @@ func RenderPlan(w io.Writer, plan *PurgePlan, apply bool) {
 		verb = "Will remove"
 	}
 	fmt.Fprintf(w, "%s %d file copy/copies from %d snapshot(s):\n\n", verb, len(plan.Targets), countSnapshots(plan))
+
+	for _, f := range plan.Folders {
+		fmt.Fprintf(w, "  [%s] %s/\n", f.Label(), f.RelPath)
+		fmt.Fprintf(w, "       subvol %s, %s apparent across %d file(s), reclaim %s\n",
+			f.Pair, FormatBytes(f.Apparent), f.Files, FormatBytes(f.Usage.Bytes))
+		fmt.Fprintf(w, "       the whole folder is removed from %d snapshot(s):\n", f.Snaps())
+		for _, h := range f.Holders {
+			fmt.Fprintf(w, "       - %s\n", filepath.Join(h.Root, f.RelPath))
+		}
+		fmt.Fprintln(w)
+	}
+	if len(plan.Folders) > 0 && len(ids) > 0 {
+		fmt.Fprintf(w, "  Files within them:\n\n")
+	}
+
+	listed := 0
 	for _, id := range ids {
+		if listed == planListLimit {
+			fmt.Fprintf(w, "  ... and %d more file(s), not listed here. The full list is in the log\n",
+				len(ids)-listed)
+			fmt.Fprintf(w, "  (re-run with --log-level info) and every one is re-validated before removal.\n\n")
+			break
+		}
+		listed++
 		ts := byCand[id]
 		c := ts[0].Candidate
 		fmt.Fprintf(w, "  [%d] %s\n", id, c.RelPath)

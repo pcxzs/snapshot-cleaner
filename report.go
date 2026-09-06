@@ -25,7 +25,19 @@ type ScanState struct {
 	FreeBytes    uint64      `json:"free_bytes"`
 	Pairs        []Pair      `json:"pairs"`
 	Candidates   []Candidate `json:"candidates"`
+
+	// Folders is set by a folder-view scan and empty otherwise. The two views
+	// are alternatives: a folder scan collects files far below any threshold
+	// worth listing individually, so it records the rollups and lets purge
+	// rebuild a folder's members from the snapshots when it needs them.
+	Folders []Folder `json:"folders,omitempty"`
+	// FolderMinSize is the rollup threshold a folder scan used, so the report
+	// can say what it filtered on.
+	FolderMinSize uint64 `json:"folder_min_size,omitempty"`
 }
+
+// FolderView reports whether this scan ranked folders rather than files.
+func (st *ScanState) FolderView() bool { return len(st.Folders) > 0 || st.FolderMinSize > 0 }
 
 // SaveState writes the state file atomically, so an interrupted write cannot
 // leave purge reading a truncated candidate list.
@@ -191,6 +203,96 @@ func renderFooterNotes(w io.Writer, st *ScanState, shown []Candidate) {
 	fmt.Fprintln(w, "  Figures assume nothing outside these snapshots references the same extents.")
 }
 
+// RenderFolderTable prints the ranked folder rollups.
+func RenderFolderTable(w io.Writer, st *ScanState, top int, showAll bool) {
+	folders := st.Folders
+	if top > 0 && top < len(folders) {
+		folders = folders[:top]
+	}
+	if len(folders) == 0 {
+		fmt.Fprintf(w, "No pinned folders found at or above %s.\n", FormatBytes(st.FolderMinSize))
+		return
+	}
+
+	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
+	fmt.Fprintln(tw, "ID\tRECLAIM\tAPPARENT\tFILES\tSNAPS\tKIND\tSUBVOL\tPATH")
+
+	var total uint64
+	for _, f := range folders {
+		total += f.Usage.Bytes
+		reclaim := FormatBytes(f.Usage.Bytes)
+		if f.Usage.Approx() {
+			reclaim = "~" + reclaim
+		}
+		if f.Usage.Method == MethodNone {
+			reclaim = "?"
+		}
+		path := f.RelPath
+		if !showAll {
+			path = Truncate(path, 60)
+		}
+		fmt.Fprintf(tw, "%s\t%s\t%s\t%d\t%d/%d\t%s\t%s\t%s\n",
+			f.Label(), reclaim, FormatBytes(f.Apparent), f.Files, f.Snaps(), f.TotalIn,
+			f.Kind, f.Pair, path)
+	}
+	tw.Flush()
+
+	var files int
+	for _, f := range folders {
+		files += f.Files
+	}
+	fmt.Fprintf(w, "\nTotal shown: %s reclaimable across %d folder(s) holding %d file(s)",
+		FormatBytes(total), len(folders), files)
+	if len(st.Folders) > len(folders) {
+		fmt.Fprintf(w, " (%d more not shown; use --top 0)", len(st.Folders)-len(folders))
+	}
+	fmt.Fprintf(w, "\nFree now: %s\n", FormatBytes(st.FreeBytes))
+
+	renderFolderNotes(w, st, folders)
+}
+
+// renderFolderNotes states what the folder figures rest on. The rollup makes a
+// couple of new promises the file view does not, and they belong next to the
+// numbers rather than only in the documentation.
+func renderFolderNotes(w io.Writer, st *ScanState, shown []Folder) {
+	sampled, unmeasured, thinned := 0, 0, 0
+	for _, f := range shown {
+		switch {
+		case f.Usage.Method == MethodNone:
+			unmeasured++
+		case f.Usage.Method == MethodSampled:
+			sampled++
+		}
+		if f.Kind == FolderThinned {
+			thinned++
+		}
+	}
+
+	fmt.Fprintln(w, "\nNotes:")
+	fmt.Fprintln(w, "  RECLAIM is the disk space freed by removing the whole folder from ALL the")
+	fmt.Fprintln(w, "  snapshots holding it, counting each shared extent once. FILES is how many")
+	fmt.Fprintln(w, "  pinned files it contains; none of them need be large on its own.")
+	fmt.Fprintln(w, "  A 'deleted' folder is gone from the live filesystem entirely, and the row")
+	fmt.Fprintln(w, "  is the topmost directory that is missing, not each subdirectory under it.")
+	if thinned > 0 {
+		fmt.Fprintf(w, "  %d row(s) marked 'thinned' still exist live; only files deleted out of them\n", thinned)
+		fmt.Fprintln(w, "  are counted, and purging one leaves the live directory untouched.")
+	}
+	if sampled > 0 {
+		fmt.Fprintf(w, "  %d row(s) were too large to open file by file, so they were measured from\n", sampled)
+		fmt.Fprintln(w, "  an evenly spaced sample and scaled by apparent size. Those are estimates;")
+		fmt.Fprintln(w, "  raise --folder-sample to narrow them.")
+	}
+	if unmeasured > 0 {
+		fmt.Fprintf(w, "  %d row(s) shown as ? were not measured; raise --cost-limit to include them.\n", unmeasured)
+	}
+	if st.Costed < len(st.Folders) {
+		fmt.Fprintf(w, "  Only the %d largest of %d folders were measured (--cost-limit).\n",
+			st.Costed, len(st.Folders))
+	}
+	fmt.Fprintln(w, "  Figures assume nothing outside these snapshots references the same extents.")
+}
+
 // RenderJSON writes the machine-readable form.
 func RenderJSON(w io.Writer, st *ScanState) error {
 	enc := json.NewEncoder(w)
@@ -270,6 +372,27 @@ func (st *ScanState) Relocate(current []Pair) (dropped int) {
 			kept = append(kept, cp)
 		}
 		c.Copies = kept
+	}
+
+	// Folder rollups need the same treatment: their holder roots were recorded
+	// under the mount this process does not have.
+	for i := range st.Folders {
+		f := &st.Folders[i]
+		if l, ok := live[f.Pair]; ok {
+			f.Live = l
+			f.LivePath = filepath.Join(l, f.RelPath)
+		}
+		kept := f.Holders[:0]
+		for _, h := range f.Holders {
+			snap, ok := roots[f.Pair][h.SnapshotID]
+			if !ok {
+				dropped++
+				continue
+			}
+			h.Root = snap.Root
+			kept = append(kept, h)
+		}
+		f.Holders = kept
 	}
 	st.Pairs = current
 	return dropped

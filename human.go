@@ -81,49 +81,105 @@ func ParseSize(s string) (uint64, error) {
 	return uint64(num * mult), nil
 }
 
-// ParseIDs expands selections like "1,3,7-9" into a sorted, de-duplicated list.
-func ParseIDs(args []string) ([]int, error) {
-	seen := map[int]bool{}
+// Selection is a parsed list of row ids. A folder scan and a file scan both
+// number their rows from 1, so folder rows carry an "F" prefix on the command
+// line and the two can never be confused for one another.
+type Selection struct {
+	Files   []int
+	Folders []int
+}
+
+// ParseSelection expands selections like "1,3,7-9" and "F2,F5-F7" into sorted,
+// de-duplicated lists. In a range the prefix may be written on either end or
+// on both, so "F5-F7", "F5-7" and "f5-f7" all mean the same three folders.
+func ParseSelection(args []string) (Selection, error) {
+	files := map[int]bool{}
+	folders := map[int]bool{}
 	for _, arg := range args {
 		for _, part := range strings.Split(arg, ",") {
 			part = strings.TrimSpace(part)
 			if part == "" {
 				continue
 			}
-			lo, hi, isRange := strings.Cut(part, "-")
+			token, isFolder := stripFolderPrefix(part)
+			seen := files
+			if isFolder {
+				seen = folders
+			}
+
+			lo, hi, isRange := strings.Cut(token, "-")
 			if !isRange {
-				n, err := strconv.Atoi(part)
+				n, err := strconv.Atoi(token)
 				if err != nil {
-					return nil, fmt.Errorf("bad id %q", part)
+					return Selection{}, fmt.Errorf("bad id %q", part)
 				}
 				seen[n] = true
 				continue
 			}
+			hi = strings.TrimSpace(hi)
+			if trimmed, hiFolder := stripFolderPrefix(hi); hiFolder {
+				// A range spans one view or the other. "3-F5" asks for files
+				// and folders at once, which names nothing.
+				if !isFolder {
+					return Selection{}, fmt.Errorf("range %q mixes a file id and a folder id", part)
+				}
+				hi = trimmed
+			}
 			a, err := strconv.Atoi(strings.TrimSpace(lo))
 			if err != nil {
-				return nil, fmt.Errorf("bad range start in %q", part)
+				return Selection{}, fmt.Errorf("bad range start in %q", part)
 			}
 			b, err := strconv.Atoi(strings.TrimSpace(hi))
 			if err != nil {
-				return nil, fmt.Errorf("bad range end in %q", part)
+				return Selection{}, fmt.Errorf("bad range end in %q", part)
 			}
 			if a > b {
-				return nil, fmt.Errorf("reversed range %q", part)
+				return Selection{}, fmt.Errorf("reversed range %q", part)
 			}
 			for n := a; n <= b; n++ {
 				seen[n] = true
 			}
 		}
 	}
-	out := make([]int, 0, len(seen))
-	for n := range seen {
+	sel := Selection{Files: sortedKeys(files), Folders: sortedKeys(folders)}
+	if len(sel.Files) == 0 && len(sel.Folders) == 0 {
+		return Selection{}, fmt.Errorf("no ids given")
+	}
+	return sel, nil
+}
+
+// stripFolderPrefix removes the "F" that marks a folder row, reporting whether
+// there was one. A bare "F" is not an id, so it is left to fail as one.
+func stripFolderPrefix(s string) (string, bool) {
+	if len(s) > 1 && (s[0] == 'F' || s[0] == 'f') {
+		return s[1:], true
+	}
+	return s, false
+}
+
+func sortedKeys(m map[int]bool) []int {
+	if len(m) == 0 {
+		return nil
+	}
+	out := make([]int, 0, len(m))
+	for n := range m {
 		out = append(out, n)
 	}
 	sort.Ints(out)
-	if len(out) == 0 {
-		return nil, fmt.Errorf("no ids given")
+	return out
+}
+
+// ParseIDs expands selections like "1,3,7-9" into a sorted, de-duplicated list
+// of file ids, rejecting folder ids.
+func ParseIDs(args []string) ([]int, error) {
+	sel, err := ParseSelection(args)
+	if err != nil {
+		return nil, err
 	}
-	return out, nil
+	if len(sel.Folders) > 0 {
+		return nil, fmt.Errorf("folder ids are not valid here")
+	}
+	return sel.Files, nil
 }
 
 // Truncate shortens a path for table display, keeping the tail which is the
