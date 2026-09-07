@@ -109,11 +109,32 @@ type ScanOptions struct {
 	// below MinSize, so one manifest serves scans at several thresholds.
 	CacheFloor uint64
 	Walk       WalkMode
+
+	// Folders groups the candidates into directory rollups and ranks those
+	// instead of the files. MinSize then selects which files are collected at
+	// all rather than which are worth showing, so it is normally set far lower
+	// - the threshold that matters is FolderMinSize.
+	Folders bool
+	// FolderMinSize is the smallest rollup worth reporting, by apparent size.
+	FolderMinSize uint64
+	// FolderSample bounds the copies one rollup's measurement will open; zero
+	// means DefaultFolderSample.
+	FolderSample int
+}
+
+// ScanResult is what one scan produced. Folders is empty unless the scan asked
+// for the rollup view.
+type ScanResult struct {
+	Candidates []Candidate
+	Folders    []Folder
+	// Costed is how many rows of the ranked view were actually measured, which
+	// is the folder count in folder view and the candidate count otherwise.
+	Costed int
 }
 
 // Scan walks every snapshot of every pair and returns candidates ranked by the
 // bytes that would actually be reclaimed.
-func Scan(pairs []Pair, opts ScanOptions) ([]Candidate, error) {
+func Scan(pairs []Pair, opts ScanOptions) (*ScanResult, error) {
 	if opts.Workers <= 0 {
 		opts.Workers = DefaultWorkers()
 	}
@@ -123,9 +144,9 @@ func Scan(pairs []Pair, opts ScanOptions) ([]Candidate, error) {
 	}
 	opts.Walk = chooseWalk(pairs, opts.Walk)
 
-	Infof("scan", "starting: %d pair(s), min-size=%s workers=%d include-replaced=%v excludes=%v cost-limit=%d priority=%s walk=%s cache-floor=%s",
+	Infof("scan", "starting: %d pair(s), min-size=%s workers=%d include-replaced=%v excludes=%v cost-limit=%d priority=%s walk=%s cache-floor=%s folders=%v folder-min-size=%s",
 		len(pairs), FormatBytes(opts.MinSize), opts.Workers, opts.IncludeReplaced, opts.Excludes, opts.CostLimit,
-		opts.Priority, opts.Walk, FormatBytes(opts.CacheFloor))
+		opts.Priority, opts.Walk, FormatBytes(opts.CacheFloor), opts.Folders, FormatBytes(opts.FolderMinSize))
 
 	var all []Candidate
 	for _, pair := range pairs {
@@ -140,6 +161,10 @@ func Scan(pairs []Pair, opts ScanOptions) ([]Candidate, error) {
 		all = append(all, cands...)
 	}
 
+	if opts.Folders {
+		return scanFolders(all, opts)
+	}
+
 	// Cost the most promising candidates first; measuring every one would mean
 	// reading extent maps for thousands of files to rank a handful.
 	sort.Slice(all, func(i, j int) bool { return all[i].Apparent > all[j].Apparent })
@@ -151,13 +176,7 @@ func Scan(pairs []Pair, opts ScanOptions) ([]Candidate, error) {
 	costStart := time.Now()
 	costSet(all[:limit], opts)
 	Infof("scan", "measurement finished in %s", time.Since(costStart).Round(time.Millisecond))
-	if opts.Cache != nil {
-		Infof("scan", "cache: %d/%d snapshot manifest(s) reused, %d/%d measurement(s) reused",
-			opts.Cache.Stats.ManifestHits.Load(),
-			opts.Cache.Stats.ManifestHits.Load()+opts.Cache.Stats.ManifestMisses.Load(),
-			opts.Cache.Stats.MeasureHits.Load(),
-			opts.Cache.Stats.MeasureHits.Load()+opts.Cache.Stats.MeasureMisses.Load())
-	}
+	logCacheStats(opts.Cache)
 
 	sort.Slice(all, func(i, j int) bool {
 		if all[i].Usage.Bytes != all[j].Usage.Bytes {
@@ -169,7 +188,58 @@ func Scan(pairs []Pair, opts ScanOptions) ([]Candidate, error) {
 		all[i].ID = i + 1
 	}
 	logCandidates(all, limit)
-	return all, nil
+	return &ScanResult{Candidates: all, Costed: limit}, nil
+}
+
+// scanFolders turns the flat candidate list into ranked directory rollups.
+//
+// The candidates themselves are not carried into the result. In folder view
+// there are usually far too many of them to be worth writing down - the whole
+// point of the view is that individually they are all small - and purge does
+// not need them: it rebuilds a folder's file list from the snapshots.
+func scanFolders(all []Candidate, opts ScanOptions) (*ScanResult, error) {
+	rollup := rollupFolders(all, opts.FolderMinSize)
+	Infof("scan", "rolled %d candidate(s) up into %d folder(s) at or above %s",
+		len(all), len(rollup.Folders), FormatBytes(opts.FolderMinSize))
+
+	sort.Sort(byFolderApparent(rollup))
+	limit := opts.CostLimit
+	if limit <= 0 || limit > len(rollup.Folders) {
+		limit = len(rollup.Folders)
+	}
+	Infof("scan", "measuring the %d largest of %d folder(s)", limit, len(rollup.Folders))
+	costStart := time.Now()
+	costFolders(rollup, limit, opts)
+	Infof("scan", "measurement finished in %s", time.Since(costStart).Round(time.Millisecond))
+	logCacheStats(opts.Cache)
+
+	rankFolders(rollup.Folders)
+	logFolders(rollup.Folders, limit)
+	return &ScanResult{Folders: rollup.Folders, Costed: limit}, nil
+}
+
+// byFolderApparent sorts the rollup and its parallel member lists together, so
+// the largest folders are the ones the cost limit spends its budget on.
+type byFolderApparent folderRollup
+
+func (r byFolderApparent) Len() int { return len(r.Folders) }
+func (r byFolderApparent) Less(i, j int) bool {
+	return r.Folders[i].Apparent > r.Folders[j].Apparent
+}
+func (r byFolderApparent) Swap(i, j int) {
+	r.Folders[i], r.Folders[j] = r.Folders[j], r.Folders[i]
+	r.Members[i], r.Members[j] = r.Members[j], r.Members[i]
+}
+
+func logCacheStats(c *Cache) {
+	if c == nil {
+		return
+	}
+	Infof("scan", "cache: %d/%d snapshot manifest(s) reused, %d/%d measurement(s) reused",
+		c.Stats.ManifestHits.Load(),
+		c.Stats.ManifestHits.Load()+c.Stats.ManifestMisses.Load(),
+		c.Stats.MeasureHits.Load(),
+		c.Stats.MeasureHits.Load()+c.Stats.MeasureMisses.Load())
 }
 
 // found is one file seen inside one snapshot, whether it was just walked or
@@ -571,6 +641,29 @@ func clearProgress(w io.Writer) {
 		return
 	}
 	fmt.Fprint(w, "\r\033[K")
+}
+
+// logFolders records the ranked rollups, the folder-view counterpart of
+// logCandidates.
+func logFolders(all []Folder, costed int) {
+	if !LogEnabled(LevelInfo) {
+		return
+	}
+	Infof("scan", "ranked %d folder(s) (%d measured):", len(all), costed)
+	var total uint64
+	for i, f := range all {
+		total += f.Usage.Bytes
+		if i >= 100 {
+			continue
+		}
+		Infof("scan", "  #%-4s reclaim=%-12s apparent=%-12s files=%-8d copies=%d measured=%d snaps=%d/%d method=%-10s kind=%-8s %s:%s",
+			f.Label(), FormatBytes(f.Usage.Bytes), FormatBytes(f.Apparent), f.Files, f.CopyN,
+			f.Measured, f.Snaps(), f.TotalIn, f.Usage.Method, f.Kind, f.Pair, f.RelPath)
+	}
+	if len(all) > 100 {
+		Infof("scan", "  ... %d further row(s) not itemised", len(all)-100)
+	}
+	Infof("scan", "total reclaimable across all folders: %s", FormatBytes(total))
 }
 
 // logCandidates records the ranked result so a run can be reviewed afterwards

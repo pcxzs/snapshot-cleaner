@@ -189,10 +189,11 @@ func TestIntegrationMeasureAndPurge(t *testing.T) {
 		}
 	}
 
-	cands, err := Scan([]Pair{pair}, ScanOptions{MinSize: 1 << 20, CostLimit: 0})
+	res, err := Scan([]Pair{pair}, ScanOptions{MinSize: 1 << 20, CostLimit: 0})
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
+	cands := res.Candidates
 	if len(cands) != 1 {
 		t.Fatalf("got %d candidates, want exactly 1 (junk.iso); got %+v", len(cands), cands)
 	}
@@ -302,10 +303,11 @@ func TestIntegrationPartialPurgeFreesNothing(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cands, err := Scan([]Pair{pair}, ScanOptions{MinSize: 1 << 20, CostLimit: 0})
+	res, err := Scan([]Pair{pair}, ScanOptions{MinSize: 1 << 20, CostLimit: 0})
 	if err != nil {
 		t.Fatal(err)
 	}
+	cands := res.Candidates
 	if len(cands) != 1 || len(cands[0].Copies) != 2 {
 		t.Fatalf("unexpected scan result: %+v", cands)
 	}
@@ -475,11 +477,11 @@ func scanWith(t *testing.T, pair Pair, opts ScanOptions) []Candidate {
 	if opts.MinSize == 0 {
 		opts.MinSize = 1 << 20
 	}
-	cands, err := Scan([]Pair{pair}, opts)
+	res, err := Scan([]Pair{pair}, opts)
 	if err != nil {
 		t.Fatalf("Scan: %v", err)
 	}
-	return cands
+	return res.Candidates
 }
 
 // The test that matters most: a cached scan and a cold one must agree. If they

@@ -26,6 +26,7 @@ are still pinned by snapshots.
 6. [Command reference](#6-command-reference)
 6a. [The scan cache](#6a-the-scan-cache)
 7. [Reading the scan output](#7-reading-the-scan-output)
+7a. [Folder view](#7a-folder-view)
 8. [Purging safely](#8-purging-safely)
 9. [Snapshot layouts](#9-snapshot-layouts)
 10. [Configuration](#10-configuration)
@@ -322,12 +323,16 @@ Finds and ranks pinned files. Read-only. Writes its results to a state file that
 | `--exclude GLOB` | | Skip matching paths. Matches the path relative to the subvolume root, the file's name, or any directory above it - so `cache` and `cache/*` both skip the whole subtree. Repeatable. |
 | `--cost-limit N` | `200` | Measure at most this many candidates. `0` measures all. |
 | `--workers N` | auto | Snapshots walked in parallel. Auto is `min(NumCPU, 8)`. |
+| `--folders` | off | Rank whole directories instead of files. See [§ 7a](#7a-folder-view). |
+| `--file-min-size SIZE` | `0` | With `--folders`, the per-file floor. `--min-size` then applies to the folder. |
+| `--folder-sample N` | `20000` | With `--folders`, the most file copies one folder's measurement will open. `0` measures all. |
 | `--json` | off | Machine-readable output. |
 
 ```sh
 sudo snapshot-cleaner scan
 sudo snapshot-cleaner scan --scope @home --min-size 500M
 sudo snapshot-cleaner scan --exclude '*.log' --exclude 'cache' --top 0
+sudo snapshot-cleaner scan --folders --min-size 100M
 sudo snapshot-cleaner scan --json > pinned.json
 ```
 
@@ -451,15 +456,46 @@ Removes selected files from the snapshots holding them.
 snapshot-cleaner purge 3                  # dry run
 snapshot-cleaner purge 1,3,7-9            # dry run, ids and ranges
 sudo snapshot-cleaner purge 1-4 --apply
+sudo snapshot-cleaner purge F2 --apply    # a whole folder, after scan --folders
+sudo snapshot-cleaner purge F2-F5 --apply
 sudo snapshot-cleaner purge --interactive --apply
 ```
 
 Ids come from the last `scan` and change every time you rescan. Always read the
 dry run.
 
-**Interactive keys:** `↑`/`↓` or `k`/`j` move · `Space` toggles · `a` selects all ·
-`n` clears · `/` filters · `g`/`G` jump to top/bottom · `Enter` confirms ·
-`q` cancels. The footer shows a running total of what you have selected.
+Plain ids select file rows; ids prefixed with `F` select folder rows from a
+`scan --folders`. In a range the prefix may be written on either end, so
+`F5-F7`, `F5-7` and `f5-f7` all mean the same three folders. A range that mixes
+the two is rejected rather than guessed at. See [§ 7a](#7a-folder-view).
+
+**Interactive keys:** `↑`/`↓` or `k`/`j` move · `Space` toggles · `a` selects or
+clears every row currently shown · `A` selects **all** rows, filter or no
+filter · `n` clears everything · `/` filters · `g`/`G` jump to top/bottom ·
+`Enter` confirms · `q` cancels. The footer shows how many of the total are
+selected and what they add up to.
+
+`a` is a toggle: press it again and the rows it just ticked are cleared, so
+hitting it by accident on a long list costs nothing. It acts on what the filter
+is showing, which is what makes "filter, then `a`" a useful way to select a
+whole subtree. `A` ignores the filter and takes everything — the distinction
+matters, because a select-all that quietly meant "all of the ones I happen to be
+looking at" is the sort of thing only noticed afterwards.
+
+**After a folder scan** the picker lists folders instead of files, with a file
+count beside each row and `thinned` marked on the rows whose live directory
+survives:
+
+```
+> [x]  ~4.21 GiB    48213 files  4/8  @home   user/projects/old-app/
+  [ ]   1.10 GiB      312 files  8/8  @home   user/Downloads/ (thinned)
+```
+
+Confirming expands each chosen folder into its member files exactly as
+`purge F1` would. Which view you get follows the scan: a folder scan keeps no
+per-file candidates and a file scan has no rollups, so there is nothing to
+switch between within one saved scan — rerun `scan` with or without `--folders`
+to change view.
 
 ### `journal`
 
@@ -517,6 +553,118 @@ Markers:
 byte-identical to the live file. They share every extent with the live copy, so
 removing them from snapshots frees nothing. On one real scan, 171 such
 path-groups were correctly discarded.
+
+---
+
+## 7a. Folder view
+
+### Why a file list is not enough
+
+Ranking files finds big files. It cannot find the other half of the problem: a
+deleted `node_modules`, a cleared photo import, a build cache, a removed
+Maildir. Those pin gigabytes as tens of thousands of small files, and no single
+file in them comes near a `--min-size` worth setting for a file list. Lower the
+threshold far enough to catch them and the report becomes a hundred thousand
+rows nobody can read - which is the same as not reporting them at all.
+
+`--folders` adds them up and ranks the directories:
+
+```sh
+sudo snapshot-cleaner scan --folders --min-size 100M
+```
+
+```
+  ID   RECLAIM    APPARENT  FILES  SNAPS  KIND     SUBVOL  PATH
+  F1   ~4.21 GiB  5.02 GiB  48213    4/8  deleted  @home   user/projects/old-app
+  F2    1.10 GiB  1.11 GiB    312    8/8  thinned  @home   user/Downloads
+```
+
+### The columns
+
+- **ID** - folder rows are numbered `F1`, `F2`, ... A file scan and a folder
+  scan both number from 1, so the prefix keeps them from being confused. It is
+  what you pass to `purge`.
+- **FILES** - how many pinned files the row covers. None of them need be large.
+- **KIND** - `deleted` means the directory is gone from the live filesystem
+  entirely; `thinned` means it is still there and only files deleted out of it
+  are counted.
+- **SNAPS**, **RECLAIM**, **APPARENT** - as in the file view.
+
+### Where a row sits in the tree
+
+A `deleted` row is always the **topmost** directory that is missing from the
+live tree. If `~/projects` is gone, you get one row for `user/projects` holding
+everything beneath it, not forty rows for its subdirectories. That is both what
+you want to read and what you want to act on.
+
+If every ancestor still exists, the file was deleted out of a live directory, so
+the row is that immediate parent and is marked `thinned`. Purging a thinned row
+touches only the snapshot copies; the live directory is untouched.
+
+### Thresholds
+
+In folder view the two thresholds swap roles:
+
+| Flag | Applies to |
+|---|---|
+| `--min-size` | the folder total |
+| `--file-min-size` | each individual file, default `0` (count everything) |
+
+The `0` default is what makes small files visible at all. It costs walk memory
+and cache size rather than walk time - the walk visits every file regardless -
+so raise `--file-min-size` if a first scan of a very large filesystem needs
+bounding.
+
+Because the per-file floor drops below the cache floor, the first folder scan
+rewalks and records fuller listings than a file scan would. `cache status` will
+show it growing. `--cache-min-size` still controls what gets written.
+
+### How a folder is measured
+
+The extent union is taken across the **whole folder in one pass**, not per file
+and summed, so a file reflinked twice inside the same tree is counted once -
+exactly as the copies of one file across snapshots already are.
+
+A rollup can cover half a million file copies, and each one costs an open plus
+an ioctl. Past `--folder-sample` copies (default 20000) the folder is measured
+from an **evenly spaced sample of whole files**, scaled by apparent size, and
+the row is marked `~` with a note saying so. Whole files are sampled rather than
+individual copies: splitting a file's reflinked copies would destroy the sharing
+the union exists to measure and inflate the estimate by roughly the snapshot
+count.
+
+Sampled figures are never cached, so raising `--folder-sample` always gets you a
+better answer rather than a stale one.
+
+### Purging a folder
+
+```sh
+snapshot-cleaner purge F1                # dry run
+sudo snapshot-cleaner purge F1 --apply
+sudo snapshot-cleaner purge F1,F3 --apply
+sudo snapshot-cleaner purge F2-F5 --apply
+```
+
+The member files are **not** written to the scan state - a row can cover a
+hundred thousand of them, which would make the state file larger than the data
+it describes. `purge` rebuilds the list by walking that one directory inside
+each snapshot holding it.
+
+What makes that safe is the invariant the scan cache already rests on: a
+snapshot is read-only and its `ctransid` moves on any change. A holder whose
+`ctransid` still matches the scan cannot have gained or lost a file since, so
+the rebuilt list is the list that was measured and shown. A holder that does not
+match is refused with a note telling you to rescan, and the rest of the folder
+proceeds. Every rebuilt file then goes through the ordinary
+[`BuildPlan`](#8-purging-safely) validation: still absent from the live tree,
+still a regular file, snapshot not received, fingerprint unchanged.
+
+The dry run shows the folder as a folder - its file count, its total, and the
+snapshots it will be removed from - then itemises the first 50 files and says
+how many it held back. The full list always goes to the log at `info` level.
+
+`--interactive` works here too: after a folder scan the picker lists folders,
+with their file counts, and confirming expands the chosen rows the same way.
 
 ---
 
@@ -670,6 +818,36 @@ needs diagnosing on a machine you cannot reach. It records:
 
 Trace output is budgeted so a scan of millions of inodes cannot fill the disk it
 is trying to free; it says when it stops.
+
+### One command that produces a log worth reading
+
+If you want a log to attach to a bug report, or you want to see what the tool
+does before pointing it at your own snapshots:
+
+```sh
+make selftest
+```
+
+It builds a throwaway btrfs fixture — a subvolume holding a tree of thousands
+of small files, a photo import, two large files, one of them reflinked, and
+three read-only snapshots — deletes most of it from the live tree, and then
+runs every read-only path across it: both views, the cache cold and warm,
+sampling, exclusion, every purge dry run, and every case the purge is supposed
+to refuse. It needs no root, and it never touches your real snapshots or your
+real scan cache.
+
+Two files come out. `selftest-summary.log` is small and ends in a report that
+lists every step's exit code, what each scan found, and every refusal, warning
+and error attributed to the step that produced it. `selftest.log` is the same
+run with every trace line, for when the summary points at a step and you need
+the detail. Three steps are meant to fail — they assert error messages — and
+the report counts those separately, so the line to check is `unexpected
+failures: 0`.
+
+`scripts/selftest.sh` takes `SELFTEST_REUSE=1` to keep the fixture between
+runs, `SELFTEST_CLEAN=1` to remove it afterwards, `SELFTEST_DIR=` to put it
+somewhere else (it must be on btrfs), and `SELFTEST_APPLY=1` to add a real
+`--apply` purge at the end, which is the only part that asks for root.
 
 A typical counter summary:
 
@@ -907,9 +1085,15 @@ cleanup.go         reseal registry and signal handling
 
 ```sh
 make test                                    # unit, no root
+make selftest                                # end to end on a btrfs fixture, no root
 sudo SNAPSHOT_CLEANER_INTEGRATION=1 make integration
 go test -race ./...
 ```
+
+`make selftest` is described in [section 11](#11-logs-and-diagnostics). It sits
+between the two: the unit tests prove the accounting in isolation, the
+integration tests prove the destructive path under root, and the self test
+proves the whole program behaves on a real filesystem without needing any.
 
 Integration tests build a throwaway btrfs filesystem in a loopback image and
 exercise the destructive path there. They never touch the host's snapshots. They
@@ -949,7 +1133,12 @@ trusted. Regenerate with a C program including `<linux/btrfs.h>`.
 - **No undo.** Unlinking from a snapshot is permanent. The journal is a record,
   not a backup.
 - **No whole-snapshot deletion**, by design.
-- **`--min-size` hides small files.** Default 50 MB.
+- **`--min-size` hides small files.** Default 50 MB. `--folders` is the answer
+  for space held as many small files; see [§ 7a](#7a-folder-view).
+- **A folder scan collects every file**, so it uses considerably more memory and
+  cache than a file scan of the same filesystem. `--file-min-size` bounds it.
+- **Large folders are measured from a sample**, marked `~`, past
+  `--folder-sample` copies. Default 20000.
 - **`--exclude` filters the report, it does not speed up the scan.** The tree
   sweep reads whole metadata leaves and cannot skip a subtree. It still prunes
   on the `readdir` walk, and a pruned listing is never cached.

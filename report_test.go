@@ -238,3 +238,150 @@ func TestRenderTableOverApparentNoteCountsOnlyVisibleRows(t *testing.T) {
 		t.Errorf("rows hidden by rounding must not be counted:\n%s", out)
 	}
 }
+
+// folderState builds a folder-view scan result for the renderer tests.
+func folderState() *ScanState {
+	return &ScanState{
+		FolderMinSize: 50 << 20,
+		FreeBytes:     10 << 30,
+		Costed:        2,
+		Folders: []Folder{
+			{
+				ID: 1, Pair: "@home", RelPath: "user/projects/old-app",
+				Kind: FolderDeleted, Files: 48213, CopyN: 96426, Apparent: 5 << 30,
+				Usage:   SetUsage{Bytes: 4 << 30, Method: MethodSampled},
+				TotalIn: 8,
+				Holders: []FolderHolder{{SnapshotID: "a"}, {SnapshotID: "b"}},
+			},
+			{
+				ID: 2, Pair: "@home", RelPath: "user/Downloads",
+				Kind: FolderThinned, Files: 12, CopyN: 24, Apparent: 900 << 20,
+				Usage:   SetUsage{Bytes: 800 << 20, Method: MethodTreeSearch, Exact: true},
+				TotalIn: 8,
+				Holders: []FolderHolder{{SnapshotID: "a"}},
+			},
+		},
+	}
+}
+
+func TestRenderFolderTableShowsFileCountsAndFolderIDs(t *testing.T) {
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, folderState(), 0, true)
+	out := buf.String()
+
+	for _, want := range []string{
+		"FILES",
+		"F1", "F2",
+		"48213",
+		"user/projects/old-app",
+		"deleted", "thinned",
+		"2 folder(s) holding 48225 file(s)",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("folder table is missing %q:\n%s", want, out)
+		}
+	}
+}
+
+// A sampled figure is an estimate and must both carry the ~ marker and say why.
+func TestRenderFolderTableMarksSampledRows(t *testing.T) {
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, folderState(), 0, true)
+	out := buf.String()
+
+	if !strings.Contains(out, "~4.00 GiB") {
+		t.Errorf("a sampled row must be marked with ~:\n%s", out)
+	}
+	if !strings.Contains(out, "evenly spaced sample") {
+		t.Errorf("the notes must explain the sampling:\n%s", out)
+	}
+	if !strings.Contains(out, "--folder-sample") {
+		t.Errorf("the notes must name the flag that narrows it:\n%s", out)
+	}
+	if !strings.Contains(out, "thinned") || !strings.Contains(out, "leaves the live directory untouched") {
+		t.Errorf("the notes must explain what a thinned row means:\n%s", out)
+	}
+}
+
+func TestRenderFolderTableHonoursTop(t *testing.T) {
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, folderState(), 1, true)
+	out := buf.String()
+	if strings.Contains(out, "user/Downloads") {
+		t.Errorf("--top 1 showed a second row:\n%s", out)
+	}
+	if !strings.Contains(out, "1 more not shown") {
+		t.Errorf("the reader must be told rows were held back:\n%s", out)
+	}
+}
+
+func TestRenderFolderTableEmpty(t *testing.T) {
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, &ScanState{FolderMinSize: 50 << 20}, 0, false)
+	if !strings.Contains(buf.String(), "No pinned folders found at or above 50.0 MiB") {
+		t.Errorf("unexpected empty rendering: %q", buf.String())
+	}
+}
+
+// Folder holders are recorded under a mount point that differs on every run,
+// exactly as candidate copies are, so they need the same relocation.
+func TestRelocateRewritesFolderHolders(t *testing.T) {
+	st := &ScanState{
+		FolderMinSize: 1,
+		Folders: []Folder{{
+			ID: 1, Pair: "@home", RelPath: "user/projects",
+			Holders: []FolderHolder{
+				{SnapshotID: "2026-09-01", Root: "/run/old-mount/snapshots/2026-09-01/@home"},
+				{SnapshotID: "gone", Root: "/run/old-mount/snapshots/gone/@home"},
+			},
+		}},
+	}
+	current := []Pair{{Name: "@home", Live: "/home", Snapshots: []Snapshot{
+		{ID: "2026-09-01", Root: "/run/new-mount/snapshots/2026-09-01/@home"},
+	}}}
+
+	if dropped := st.Relocate(current); dropped != 1 {
+		t.Fatalf("dropped %d holders, want 1 (the rotated snapshot)", dropped)
+	}
+	f := st.Folders[0]
+	if len(f.Holders) != 1 || f.Holders[0].Root != "/run/new-mount/snapshots/2026-09-01/@home" {
+		t.Errorf("holders not relocated: %+v", f.Holders)
+	}
+	if f.Live != "/home" || f.LivePath != "/home/user/projects" {
+		t.Errorf("live path not refreshed: live=%q livePath=%q", f.Live, f.LivePath)
+	}
+}
+
+// A folder of many small files routinely reclaims more than the file sizes add
+// up to, because each file occupies whole blocks. Unexplained, that reads as a
+// bug in the tool rather than as how the filesystem works.
+func TestRenderFolderTableExplainsReclaimAboveApparent(t *testing.T) {
+	st := folderState()
+	st.Folders[0].Apparent = 83 << 20
+	st.Folders[0].Usage = SetUsage{Bytes: 89 << 20, Method: MethodTreeSearch, Exact: true}
+
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, st, 0, true)
+	out := buf.String()
+	if !strings.Contains(out, "RECLAIM above APPARENT") {
+		t.Errorf("the notes must explain a row that reclaims more than its apparent size:\n%s", out)
+	}
+	if !strings.Contains(out, "whole blocks") {
+		t.Errorf("the explanation must give the reason:\n%s", out)
+	}
+}
+
+// The note must not fire when the two columns render identically, or it
+// contradicts the table it is explaining.
+func TestRenderFolderTableStaysQuietOnInvisibleRounding(t *testing.T) {
+	st := folderState()
+	st.Folders[0].Apparent = 89 << 20
+	st.Folders[0].Usage = SetUsage{Bytes: 89<<20 + 512, Method: MethodTreeSearch, Exact: true}
+	st.Folders[1].Usage = SetUsage{Bytes: 1, Method: MethodTreeSearch, Exact: true}
+
+	var buf bytes.Buffer
+	RenderFolderTable(&buf, st, 0, true)
+	if out := buf.String(); strings.Contains(out, "RECLAIM above APPARENT") {
+		t.Errorf("the note fired on a difference the reader cannot see:\n%s", out)
+	}
+}

@@ -66,8 +66,10 @@ cache in an embedded key/value file.
 ```sh
 sudo snapshot-cleaner doctor                 # what was detected, and what works here
 sudo snapshot-cleaner scan --min-size 100M   # find and rank pinned files (read-only)
+sudo snapshot-cleaner scan --folders         # rank whole directories instead
 snapshot-cleaner purge 3                     # dry run: shows exactly what it would do
 sudo snapshot-cleaner purge 3 --apply        # actually remove it
+sudo snapshot-cleaner purge F1 --apply       # a whole folder
 sudo snapshot-cleaner purge --interactive --apply
 sudo snapshot-cleaner journal                # what was removed, and when
 snapshot-cleaner cache status                # what a rescan will not have to redo
@@ -98,6 +100,64 @@ A scan looks like this:
   holding it. This is the number to sort on, and it is not the file's size.
 - **APPARENT** — the file's nominal size.
 - **SNAPS** — how many of the pair's snapshots hold it (`4/8`).
+
+## Folder view, for the space a file list cannot see
+
+A list of big files finds big files. It cannot find a deleted `node_modules`,
+a cleared photo import, a build cache or a removed mail directory: those pin
+gigabytes as tens of thousands of small files, and not one of them comes near
+any `--min-size` worth setting for a file list. Set it low enough to catch them
+and you get a hundred thousand rows nobody can read.
+
+`--folders` adds them up and ranks the directories instead:
+
+```sh
+sudo snapshot-cleaner scan --folders --min-size 100M
+```
+
+```
+  ID   RECLAIM    APPARENT  FILES  SNAPS  KIND     SUBVOL  PATH
+  F1   ~4.21 GiB  5.02 GiB  48213    4/8  deleted  @home   user/projects/old-app
+  F2    1.10 GiB  1.11 GiB    312    8/8  thinned  @home   user/Downloads
+```
+
+- **`deleted`** — the directory is gone from the live filesystem entirely. The
+  row is the **topmost** missing directory, so a deleted tree is one row rather
+  than one per subdirectory inside it.
+- **`thinned`** — the directory is still there; only files deleted out of it are
+  counted. Purging one leaves the live directory alone.
+- **FILES** — how many pinned files the row covers.
+
+In this view `--min-size` is the threshold on the **folder**, and the per-file
+floor drops to `--file-min-size` (default 0, meaning count everything). That is
+what makes the small files visible, and it is the knob to raise if a first scan
+of a very large filesystem needs bounding — it costs walk memory and cache size,
+not much walk time.
+
+RECLAIM is still an extent union taken across the whole folder at once, so a
+file reflinked twice inside the same tree is counted once. Folders too large to
+open file by file are measured from an evenly spaced sample and scaled, marked
+`~`; `--folder-sample` sets that budget.
+
+Purge them by folder id, dry run first, exactly as with a file:
+
+```sh
+snapshot-cleaner purge F1               # dry run
+sudo snapshot-cleaner purge F1 --apply
+sudo snapshot-cleaner purge --interactive --apply   # pick from a list of folders
+```
+
+`--interactive` follows the scan: after `scan --folders` the checklist lists
+folders with their file counts, otherwise it lists files. In both, `a` selects
+or clears every row the filter is showing and `A` selects all of them.
+
+The member files are not written to the scan state — a row can cover a hundred
+thousand of them — so `purge` rebuilds the list by walking that one directory
+inside each snapshot holding it. What makes that safe is that a snapshot is
+read-only and its `ctransid` moves on any change: a holder whose `ctransid`
+still matches the scan cannot have gained or lost a file since, and one that
+does not match is refused with a note telling you to rescan. Every file is then
+re-validated individually like any other target.
 
 ## Scans are cached, so only the first one is slow
 
@@ -278,8 +338,17 @@ machine you cannot reach.
 
 ```sh
 make test          # unit tests, no root needed
+make selftest      # end-to-end on a real btrfs fixture, no root needed
 sudo SNAPSHOT_CLEANER_INTEGRATION=1 make integration
 ```
+
+`make selftest` builds a throwaway btrfs fixture — thousands of small files, a
+photo import, two large files, one of them reflinked, three read-only snapshots
+— deletes most of it from the live tree and then runs every read-only path
+across it: both views, the cache cold and warm, sampling, every purge dry run
+and every case the purge must refuse. It needs no root and never touches your
+own snapshots or scan cache. It leaves a short summary log ending in a report,
+and a full trace log. That is the pair to attach to a bug report.
 
 The integration tests build a throwaway btrfs filesystem in a loopback image and
 exercise the destructive path there. They never touch the host's own snapshots.
@@ -299,7 +368,10 @@ and a purge takes its snapshots' cached listings with it.
 
 - btrfs only. Other filesystems are detected and refused.
 - Whole-snapshot deletion is out of scope; that is what snapshot managers do.
-- Files smaller than `--min-size` (default 50M) are ignored.
+- Files smaller than `--min-size` (default 50M) are ignored. Use `--folders` to
+  rank directories instead, which is what finds space held as many small files.
+- A folder scan collects every file, so it uses considerably more memory and
+  cache than a file scan on the same filesystem. `--file-min-size` bounds it.
 - `--exclude` matches the path relative to the subvolume root, the file's own
   name, or any directory above it, so `cache` and `cache/*` both skip the whole
   subtree.

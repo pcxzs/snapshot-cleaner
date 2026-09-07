@@ -1,6 +1,8 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -246,5 +248,99 @@ func TestSettleFreeBytesReturnsAReading(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 5*time.Second {
 		t.Errorf("took %s, should have returned as soon as the reading stabilised", elapsed)
+	}
+}
+
+// planFor builds a plan over n synthetic files, optionally expanded from a
+// folder, for the rendering tests.
+func planFor(n int, folders []Folder) *PurgePlan {
+	plan := &PurgePlan{Folders: folders}
+	for i := 1; i <= n; i++ {
+		c := &Candidate{
+			ID: i, Pair: "@home", RelPath: fmt.Sprintf("user/projects/f%d.js", i),
+			Apparent: 4096, Copies: []Copy{{SnapshotID: "s1", Snapshot: "/snaps/s1"}},
+			Usage: SetUsage{Bytes: 4096, Method: MethodTreeSearch, Exact: true},
+		}
+		plan.Targets = append(plan.Targets, PurgeTarget{
+			Candidate: c,
+			Copy:      Copy{SnapshotID: "s1", Snapshot: "/snaps/s1", Path: fmt.Sprintf("/snaps/s1/user/projects/f%d.js", i)},
+		})
+		plan.Estimated += 4096
+	}
+	return plan
+}
+
+// A folder purge can cover tens of thousands of files. Printing every one is
+// not a review, so the dry run has to stay readable and say what it held back.
+func TestRenderPlanCapsTheFileListing(t *testing.T) {
+	var buf bytes.Buffer
+	RenderPlan(&buf, planFor(planListLimit+25, nil), false)
+	out := buf.String()
+
+	if !strings.Contains(out, "and 25 more file(s)") {
+		t.Errorf("the listing was not capped, or did not say so:\n%s", truncateForTest(out))
+	}
+	if !strings.Contains(out, "re-validated before removal") {
+		t.Errorf("the reader must be told the unlisted files are still checked:\n%s", truncateForTest(out))
+	}
+	if strings.Contains(out, fmt.Sprintf("f%d.js", planListLimit+25)) {
+		t.Error("a file past the cap was itemised anyway")
+	}
+	// The totals are the part that must never be elided.
+	if !strings.Contains(out, fmt.Sprintf("%d file copy/copies", planListLimit+25)) {
+		t.Errorf("the summary count is missing:\n%s", truncateForTest(out))
+	}
+}
+
+func TestRenderPlanShowsTheFolderItWasExpandedFrom(t *testing.T) {
+	folder := Folder{
+		ID: 3, Pair: "@home", RelPath: "user/projects", Kind: FolderDeleted,
+		Files: 5, Apparent: 20480, Usage: SetUsage{Bytes: 20480, Method: MethodTreeSearch, Exact: true},
+		Holders: []FolderHolder{{SnapshotID: "s1", Root: "/snaps/s1"}},
+	}
+	var buf bytes.Buffer
+	RenderPlan(&buf, planFor(5, []Folder{folder}), false)
+	out := buf.String()
+
+	for _, want := range []string{
+		"[F3] user/projects/",
+		"across 5 file(s)",
+		"the whole folder is removed from 1 snapshot(s)",
+		"/snaps/s1/user/projects",
+		"Files within them:",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("plan is missing %q:\n%s", want, truncateForTest(out))
+		}
+	}
+}
+
+func truncateForTest(s string) string {
+	if len(s) > 2000 {
+		return s[:2000] + "\n..."
+	}
+	return s
+}
+
+// A folder purge expands to one id per file, and the raw slice would be a
+// single twenty-kilobyte log line that buries everything around it.
+func TestSummariseIDsKeepsTheLogHeaderReadable(t *testing.T) {
+	short := []int{1, 2, 3}
+	if got := summariseIDs(short); got != "[1 2 3]" {
+		t.Errorf("summariseIDs(%v) = %q, want the ids themselves", short, got)
+	}
+
+	long := make([]int, 3000)
+	for i := range long {
+		long[i] = i + 1
+	}
+	got := summariseIDs(long)
+	if len(got) > 120 {
+		t.Errorf("summary is %d chars, still too long to read: %q", len(got), got)
+	}
+	for _, want := range []string{"1 2 3", "3000", "(3000 ids)"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("summary %q is missing %q", got, want)
+		}
 	}
 }

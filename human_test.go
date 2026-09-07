@@ -2,6 +2,7 @@ package main
 
 import (
 	"flag"
+	"fmt"
 	"io"
 	"reflect"
 	"testing"
@@ -150,5 +151,49 @@ func TestPermuteArgsStopsAtDoubleDash(t *testing.T) {
 	}
 	if got := fs.Args(); len(got) != 2 {
 		t.Errorf("operands = %v, want two", got)
+	}
+}
+
+func TestParseSelectionSplitsFileAndFolderIDs(t *testing.T) {
+	sel, err := ParseSelection([]string{"1,3", "F2,F5-F7", "9-10", "f12"})
+	if err != nil {
+		t.Fatalf("ParseSelection: %v", err)
+	}
+	wantFiles := []int{1, 3, 9, 10}
+	wantFolders := []int{2, 5, 6, 7, 12}
+	if fmt.Sprint(sel.Files) != fmt.Sprint(wantFiles) {
+		t.Errorf("Files = %v, want %v", sel.Files, wantFiles)
+	}
+	if fmt.Sprint(sel.Folders) != fmt.Sprint(wantFolders) {
+		t.Errorf("Folders = %v, want %v", sel.Folders, wantFolders)
+	}
+}
+
+func TestParseSelectionAcceptsAHalfPrefixedRange(t *testing.T) {
+	sel, err := ParseSelection([]string{"F5-7"})
+	if err != nil {
+		t.Fatalf("ParseSelection: %v", err)
+	}
+	if fmt.Sprint(sel.Folders) != fmt.Sprint([]int{5, 6, 7}) {
+		t.Errorf("Folders = %v, want [5 6 7]", sel.Folders)
+	}
+	if len(sel.Files) != 0 {
+		t.Errorf("Files = %v, want none", sel.Files)
+	}
+}
+
+// A file id and a folder id name rows in two different tables, so a range
+// across them names nothing and must not be guessed at.
+func TestParseSelectionRejectsMixedRanges(t *testing.T) {
+	for _, bad := range [][]string{{"3-F5"}, {"F"}, {"F3-F1"}, {"Fx"}} {
+		if sel, err := ParseSelection(bad); err == nil {
+			t.Errorf("ParseSelection(%v) = %+v, want an error", bad, sel)
+		}
+	}
+}
+
+func TestParseIDsRejectsFolderIDs(t *testing.T) {
+	if _, err := ParseIDs([]string{"F1"}); err == nil {
+		t.Error("ParseIDs must not silently accept a folder id")
 	}
 }

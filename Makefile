@@ -13,7 +13,7 @@ export CGO_ENABLED := 0
 # log nothing unless asked with --debug/--log-level.
 DEBUG_LDFLAGS := -X main.Version=$(VERSION)-debug -X main.defaultLogLevel=trace
 
-.PHONY: all build debug test vet fmt install clean release integration
+.PHONY: all build debug test vet fmt install clean release integration selftest
 
 all: build
 
@@ -42,6 +42,14 @@ integration: $(BINARY)-integration.test
 # stale binary and silently test code you already changed.
 $(BINARY)-integration.test: $(wildcard *.go) go.mod go.sum
 	$(GO) test -c -o $@ .
+
+# Builds a throwaway btrfs fixture, runs every read-only path against it and
+# leaves one summary and one full trace log behind. Needs no root: the fixture
+# is made with unprivileged `btrfs subvolume create`, and state, cache and
+# runtime directories all point inside the work directory, never at the real
+# ones. See scripts/selftest.sh for the environment variables it takes.
+selftest:
+	./scripts/selftest.sh
 
 vet:
 	$(GO) vet ./...

@@ -9,14 +9,72 @@ import (
 	"golang.org/x/term"
 )
 
-// RunPicker shows an interactive checklist of candidates and returns the ids
-// the user selected. It is a plain raw-mode renderer rather than a full TUI
-// dependency: the tool has to stay a single self-contained binary.
-func RunPicker(cands []Candidate) ([]int, error) {
+// pickRow is one selectable line, flattened from a candidate or from a folder
+// rollup so the picker itself never needs to know which view it is showing.
+type pickRow struct {
+	ID      int    // returned to the caller when the row is selected
+	Bytes   uint64 // reclaimable bytes
+	Approx  bool   // render with a leading "~"
+	Unknown bool   // not measured; render as "?"
+	Files   int    // pinned files behind the row; only a folder has these
+	Holders int
+	TotalIn int
+	Pair    string
+	Path    string
+}
+
+// CandidateRows flattens a file scan for the picker.
+func CandidateRows(cands []Candidate) []pickRow {
+	rows := make([]pickRow, 0, len(cands))
+	for _, c := range cands {
+		rows = append(rows, pickRow{
+			ID: c.ID, Bytes: c.Usage.Bytes,
+			Approx:  c.Usage.Approx(),
+			Unknown: c.Usage.Method == MethodNone,
+			Holders: len(c.Copies), TotalIn: c.TotalIn,
+			Pair: c.Pair, Path: c.RelPath,
+		})
+	}
+	return rows
+}
+
+// FolderRows flattens a folder scan for the picker. The ids are folder ids, so
+// what comes back has to be handed to the folder expansion rather than looked
+// up as candidates.
+func FolderRows(folders []Folder) []pickRow {
+	rows := make([]pickRow, 0, len(folders))
+	for _, f := range folders {
+		path := f.RelPath + "/"
+		if f.Kind == FolderThinned {
+			// A thinned row does not remove the directory, only files that
+			// were deleted out of it, and the list is the one place a reader
+			// cannot see the KIND column to tell the difference.
+			path = f.RelPath + "/ (thinned)"
+		}
+		rows = append(rows, pickRow{
+			ID: f.ID, Bytes: f.Usage.Bytes,
+			Approx:  f.Usage.Approx(),
+			Unknown: f.Usage.Method == MethodNone,
+			Files:   f.Files,
+			Holders: f.Snaps(), TotalIn: f.TotalIn,
+			Pair: f.Pair, Path: path,
+		})
+	}
+	return rows
+}
+
+// RunPicker shows an interactive checklist and returns the ids the user
+// selected. It is a plain raw-mode renderer rather than a full TUI dependency:
+// the tool has to stay a single self-contained binary.
+//
+// title names what is being chosen, because the same widget picks files after
+// a plain scan and whole folders after `scan --folders`, and the two are very
+// different things to confirm.
+func RunPicker(rows []pickRow, title string) ([]int, error) {
 	if !term.IsTerminal(int(os.Stdin.Fd())) {
 		return nil, fmt.Errorf("--interactive needs a terminal on stdin")
 	}
-	if len(cands) == 0 {
+	if len(rows) == 0 {
 		return nil, nil
 	}
 
@@ -33,8 +91,15 @@ func RunPicker(cands []Candidate) ([]int, error) {
 	fmt.Fprint(os.Stdout, "\033[?25l") // hide cursor
 
 	p := &picker{
-		cands:    cands,
+		rows:     rows,
+		title:    title,
 		selected: map[int]bool{},
+	}
+	for _, r := range rows {
+		if r.Files > 0 {
+			p.showFiles = true
+			break
+		}
 	}
 	p.applyFilter()
 
@@ -58,27 +123,75 @@ func RunPicker(cands []Candidate) ([]int, error) {
 }
 
 type picker struct {
-	cands    []Candidate
-	view     []int // indices into cands, after filtering
-	selected map[int]bool
-	cursor   int
-	offset   int
-	filter   string
-	filtered bool
-	rows     int
+	rows      []pickRow
+	title     string
+	showFiles bool  // the rows carry file counts, so give them a column
+	view      []int // indices into rows, after filtering
+	selected  map[int]bool
+	cursor    int
+	offset    int
+	filter    string
+	filtered  bool
+	height    int
 }
 
 func (p *picker) applyFilter() {
 	p.view = p.view[:0]
 	needle := strings.ToLower(p.filter)
-	for i, c := range p.cands {
-		if needle == "" || strings.Contains(strings.ToLower(c.RelPath), needle) {
+	for i, r := range p.rows {
+		if needle == "" || strings.Contains(strings.ToLower(r.Path), needle) {
 			p.view = append(p.view, i)
 		}
 	}
 	if p.cursor >= len(p.view) {
 		p.cursor = max(0, len(p.view)-1)
 	}
+}
+
+// allShownSelected reports whether every row the filter is showing is already
+// ticked, which is what makes "a" a toggle rather than a one-way action.
+func (p *picker) allShownSelected() bool {
+	if len(p.view) == 0 {
+		return false
+	}
+	for _, i := range p.view {
+		if !p.selected[p.rows[i].ID] {
+			return false
+		}
+	}
+	return true
+}
+
+// setShown ticks or clears every row the filter is showing.
+func (p *picker) setShown(on bool) {
+	for _, i := range p.view {
+		p.selected[p.rows[i].ID] = on
+	}
+}
+
+// setAll ticks or clears every row, filtered out or not. Without it "select
+// all" would quietly mean "all of the ones I happen to be looking at", which
+// is the sort of thing that is only noticed after the fact.
+func (p *picker) setAll(on bool) {
+	for _, r := range p.rows {
+		p.selected[r.ID] = on
+	}
+}
+
+// text renders one row's columns.
+func (p *picker) text(r pickRow) string {
+	size := FormatBytes(r.Bytes)
+	switch {
+	case r.Unknown:
+		size = "?"
+	case r.Approx:
+		size = "~" + size
+	}
+	if p.showFiles {
+		return fmt.Sprintf("%10s  %7d files  %d/%d  %-7s %s",
+			size, r.Files, r.Holders, r.TotalIn, r.Pair, r.Path)
+	}
+	return fmt.Sprintf("%10s  %d/%d  %-7s %s", size, r.Holders, r.TotalIn, r.Pair, r.Path)
 }
 
 func (p *picker) size() (int, int) {
@@ -91,37 +204,36 @@ func (p *picker) size() (int, int) {
 
 func (p *picker) draw() {
 	w, h := p.size()
-	p.rows = max(3, h-6)
+	p.height = max(3, h-6)
 
 	if p.cursor < p.offset {
 		p.offset = p.cursor
 	}
-	if p.cursor >= p.offset+p.rows {
-		p.offset = p.cursor - p.rows + 1
+	if p.cursor >= p.offset+p.height {
+		p.offset = p.cursor - p.height + 1
 	}
 
 	var b strings.Builder
 	b.WriteString("\033[H\033[2J")
-	b.WriteString("Select files to remove from their snapshots\r\n")
-	b.WriteString("\033[2mspace toggle · a all · n none · / filter · enter confirm · q cancel\033[0m\r\n\r\n")
+	b.WriteString(p.title + "\r\n")
+	b.WriteString("\033[2mspace toggle · a all shown · A all · n none · / filter · enter confirm · q cancel\033[0m\r\n\r\n")
 
-	for row := 0; row < p.rows; row++ {
+	for row := 0; row < p.height; row++ {
 		idx := p.offset + row
 		if idx >= len(p.view) {
 			b.WriteString("\r\n")
 			continue
 		}
-		c := p.cands[p.view[idx]]
+		r := p.rows[p.view[idx]]
 		mark := " "
-		if p.selected[c.ID] {
+		if p.selected[r.ID] {
 			mark = "x"
 		}
 		cursor := "  "
 		if idx == p.cursor {
 			cursor = "> "
 		}
-		line := fmt.Sprintf("%s[%s] %9s  %d/%d  %-7s %s",
-			cursor, mark, FormatBytes(c.Usage.Bytes), len(c.Copies), c.TotalIn, c.Pair, c.RelPath)
+		line := fmt.Sprintf("%s[%s] %s", cursor, mark, p.text(r))
 		if len(line) > w-1 {
 			line = Truncate(line, w-1)
 		}
@@ -133,17 +245,25 @@ func (p *picker) draw() {
 		b.WriteString("\r\n")
 	}
 
-	var total uint64
-	for _, c := range p.cands {
-		if p.selected[c.ID] {
-			total += c.Usage.Bytes
+	var (
+		total uint64
+		files int
+	)
+	for _, r := range p.rows {
+		if p.selected[r.ID] {
+			total += r.Bytes
+			files += r.Files
 		}
 	}
 	b.WriteString("\r\n")
 	if p.filtered {
 		b.WriteString(fmt.Sprintf("filter: %s\033[7m \033[0m\r\n", p.filter))
 	} else {
-		b.WriteString(fmt.Sprintf("\033[1m%d selected · %s reclaimable\033[0m", p.countSelected(), FormatBytes(total)))
+		b.WriteString(fmt.Sprintf("\033[1m%d of %d selected · %s reclaimable\033[0m",
+			p.countSelected(), len(p.rows), FormatBytes(total)))
+		if p.showFiles && files > 0 {
+			b.WriteString(fmt.Sprintf("\033[1m · %d file(s)\033[0m", files))
+		}
 		if p.filter != "" {
 			b.WriteString(fmt.Sprintf("  \033[2m(filter %q, %d shown)\033[0m", p.filter, len(p.view)))
 		}
@@ -179,9 +299,9 @@ func (p *picker) handle(in []byte) (done, abort bool) {
 		case 'B':
 			p.move(1)
 		case '5': // page up
-			p.move(-p.rows)
+			p.move(-p.height)
 		case '6': // page down
-			p.move(p.rows)
+			p.move(p.height)
 		}
 		return false, false
 	case len(in) == 1:
@@ -201,9 +321,12 @@ func (p *picker) handle(in []byte) (done, abort bool) {
 		case 'G':
 			p.cursor = max(0, len(p.view)-1)
 		case 'a':
-			for _, i := range p.view {
-				p.selected[p.cands[i].ID] = true
-			}
+			// A toggle, so the same key undoes it. Pressing "a" by accident on
+			// a list of forty thousand rows should not need "n" and a rebuild
+			// of whatever was selected before.
+			p.setShown(!p.allShownSelected())
+		case 'A':
+			p.setAll(true)
 		case 'n':
 			p.selected = map[int]bool{}
 		case '/':
@@ -243,7 +366,7 @@ func (p *picker) toggle() {
 	if p.cursor >= len(p.view) {
 		return
 	}
-	id := p.cands[p.view[p.cursor]].ID
+	id := p.rows[p.view[p.cursor]].ID
 	p.selected[id] = !p.selected[id]
 }
 

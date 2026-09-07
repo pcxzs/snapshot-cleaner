@@ -17,6 +17,7 @@ const (
 	MethodTreeSearch Method = "treesearch" // exact on-disk bytes, compression-aware
 	MethodFiemap     Method = "fiemap"     // portable; upper bound on compressed data
 	MethodStat       Method = "stat"       // last resort, allocated blocks of one copy
+	MethodSampled    Method = "sampled"    // a folder measured from a sample and scaled
 	MethodNone       Method = "none"
 )
 
@@ -92,7 +93,7 @@ func MeasureSet(paths []string) SetUsage {
 }
 
 func unionViaTreeSearch(paths []string) (total uint64, compressed bool, ok bool) {
-	var all []diskExtent
+	set := newExtentSet()
 	for _, p := range paths {
 		exts, err := treeSearchExtents(p)
 		if err != nil {
@@ -100,14 +101,13 @@ func unionViaTreeSearch(paths []string) (total uint64, compressed bool, ok bool)
 			return 0, false, false
 		}
 		Tracef("measure", "treesearch %s: %d extent(s)", p, len(exts))
-		all = append(all, exts...)
+		set.add(exts)
 	}
-	total, compressed = unionExtents(all)
-	return total, compressed, true
+	return set.total(), set.compressed, true
 }
 
 func unionViaFiemap(paths []string) (total uint64, encoded bool, ok bool) {
-	var all []diskExtent
+	set := newExtentSet()
 	for _, p := range paths {
 		exts, err := fiemapExtents(p)
 		if err != nil {
@@ -115,10 +115,9 @@ func unionViaFiemap(paths []string) (total uint64, encoded bool, ok bool) {
 			return 0, false, false
 		}
 		Tracef("measure", "fiemap %s: %d extent(s)", p, len(exts))
-		all = append(all, exts...)
+		set.add(exts)
 	}
-	total, encoded = unionExtents(all)
-	return total, encoded, true
+	return set.total(), set.compressed, true
 }
 
 // Offsets within the packed btrfs_file_extent_item.
@@ -306,24 +305,47 @@ func ProbeTreeSearch(dir string) error {
 	return err
 }
 
-// unionExtents sums a set of extents, counting each physical extent exactly
+// extentSet accumulates physical extents, counting each disk address exactly
 // once. This is the whole point of the measurement: a file reflinked into N
 // snapshots yields N references to the same extents, and the space freed by
 // removing all N copies is the size of the underlying extents, not N times it.
-func unionExtents(exts []diskExtent) (total uint64, compressed bool) {
-	seen := make(map[uint64]uint64, len(exts))
+//
+// References are folded in as they are read rather than collected and unioned
+// at the end. A folder rollup hands the set every file of a deleted directory
+// tree in every snapshot holding it, which is millions of extent records for a
+// tree like node_modules; holding them all at once buys nothing, since only
+// the address and the length survive the union.
+type extentSet struct {
+	seen       map[uint64]uint64
+	compressed bool
+}
+
+func newExtentSet() *extentSet { return &extentSet{seen: map[uint64]uint64{}} }
+
+func (s *extentSet) add(exts []diskExtent) {
 	for _, e := range exts {
 		if e.Compressed {
-			compressed = true
+			s.compressed = true
 		}
 		// Two references to the same disk address are the same physical
 		// extent; keep the larger length if they disagree on extent size.
-		if cur, dup := seen[e.Addr]; !dup || e.Bytes > cur {
-			seen[e.Addr] = e.Bytes
+		if cur, dup := s.seen[e.Addr]; !dup || e.Bytes > cur {
+			s.seen[e.Addr] = e.Bytes
 		}
 	}
-	for _, b := range seen {
+}
+
+func (s *extentSet) total() (total uint64) {
+	for _, b := range s.seen {
 		total += b
 	}
-	return total, compressed
+	return total
+}
+
+// unionExtents is the one-shot form, kept because it states the rule the whole
+// reclaim figure rests on in a single call.
+func unionExtents(exts []diskExtent) (total uint64, compressed bool) {
+	set := newExtentSet()
+	set.add(exts)
+	return set.total(), set.compressed
 }
