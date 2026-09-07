@@ -819,6 +819,36 @@ needs diagnosing on a machine you cannot reach. It records:
 Trace output is budgeted so a scan of millions of inodes cannot fill the disk it
 is trying to free; it says when it stops.
 
+### One command that produces a log worth reading
+
+If you want a log to attach to a bug report, or you want to see what the tool
+does before pointing it at your own snapshots:
+
+```sh
+make selftest
+```
+
+It builds a throwaway btrfs fixture — a subvolume holding a tree of thousands
+of small files, a photo import, two large files, one of them reflinked, and
+three read-only snapshots — deletes most of it from the live tree, and then
+runs every read-only path across it: both views, the cache cold and warm,
+sampling, exclusion, every purge dry run, and every case the purge is supposed
+to refuse. It needs no root, and it never touches your real snapshots or your
+real scan cache.
+
+Two files come out. `selftest-summary.log` is small and ends in a report that
+lists every step's exit code, what each scan found, and every refusal, warning
+and error attributed to the step that produced it. `selftest.log` is the same
+run with every trace line, for when the summary points at a step and you need
+the detail. Three steps are meant to fail — they assert error messages — and
+the report counts those separately, so the line to check is `unexpected
+failures: 0`.
+
+`scripts/selftest.sh` takes `SELFTEST_REUSE=1` to keep the fixture between
+runs, `SELFTEST_CLEAN=1` to remove it afterwards, `SELFTEST_DIR=` to put it
+somewhere else (it must be on btrfs), and `SELFTEST_APPLY=1` to add a real
+`--apply` purge at the end, which is the only part that asks for root.
+
 A typical counter summary:
 
 ```
@@ -1055,9 +1085,15 @@ cleanup.go         reseal registry and signal handling
 
 ```sh
 make test                                    # unit, no root
+make selftest                                # end to end on a btrfs fixture, no root
 sudo SNAPSHOT_CLEANER_INTEGRATION=1 make integration
 go test -race ./...
 ```
+
+`make selftest` is described in [section 11](#11-logs-and-diagnostics). It sits
+between the two: the unit tests prove the accounting in isolation, the
+integration tests prove the destructive path under root, and the self test
+proves the whole program behaves on a real filesystem without needing any.
 
 Integration tests build a throwaway btrfs filesystem in a loopback image and
 exercise the destructive path there. They never touch the host's snapshots. They

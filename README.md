@@ -338,8 +338,17 @@ machine you cannot reach.
 
 ```sh
 make test          # unit tests, no root needed
+make selftest      # end-to-end on a real btrfs fixture, no root needed
 sudo SNAPSHOT_CLEANER_INTEGRATION=1 make integration
 ```
+
+`make selftest` builds a throwaway btrfs fixture — thousands of small files, a
+photo import, two large files, one of them reflinked, three read-only snapshots
+— deletes most of it from the live tree and then runs every read-only path
+across it: both views, the cache cold and warm, sampling, every purge dry run
+and every case the purge must refuse. It needs no root and never touches your
+own snapshots or scan cache. It leaves a short summary log ending in a report,
+and a full trace log. That is the pair to attach to a bug report.
 
 The integration tests build a throwaway btrfs filesystem in a loopback image and
 exercise the destructive path there. They never touch the host's own snapshots.

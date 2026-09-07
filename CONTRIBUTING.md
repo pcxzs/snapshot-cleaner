@@ -15,6 +15,7 @@ detection reports into something fixable in one pass.
 make build      # ./snapshot-cleaner
 make debug      # ./snapshot-cleaner-debug, logs everything to a file
 make test       # unit tests, no root needed
+make selftest   # end-to-end run against a real btrfs fixture, no root needed
 make vet
 make fmt
 ```
@@ -22,6 +23,38 @@ make fmt
 CI runs `gofmt -l`, `go vet ./...`, `go test -race ./...` and a cross-build for
 `linux/amd64` and `linux/arm64`. Run `make fmt vet test` before pushing and it
 will pass.
+
+### Self test
+
+`make selftest` builds a throwaway btrfs fixture and drives every read-only
+path across it — both views, the cache cold and warm, sampling, the folder
+rollup, the purge dry runs and every refusal — leaving two files behind:
+
+```
+selftest-summary.log   the transcript, exit codes, timings, and a report
+selftest.log           the above plus every trace line the tool wrote
+```
+
+It needs no root: the fixture is made with unprivileged `btrfs subvolume
+create`, and the state, cache and runtime directories all point inside the work
+directory, so it never reads or writes the real ones. It is the fastest way to
+get a log worth attaching to a bug report.
+
+```sh
+make selftest                                    # rebuild the fixture, run all of it
+SELFTEST_REUSE=1 ./scripts/selftest.sh           # keep the fixture, re-run only
+SELFTEST_APPLY=1 ./scripts/selftest.sh           # also do a real --apply (asks for sudo)
+SELFTEST_CLEAN=1 ./scripts/selftest.sh           # remove the fixture afterwards
+SELFTEST_DIR=/path ./scripts/selftest.sh         # somewhere else on btrfs
+```
+
+The last line matters if `$TMPDIR` is not btrfs; the script says so and stops
+rather than testing nothing. Three steps are expected to exit non-zero (they
+assert error messages); the report at the end of the summary separates those
+from real failures, so `0 unexpected` is the line to check.
+
+Only `--apply` needs root, which is why it is opt-in: an ordinary run covers
+every read-only path and every dry run.
 
 ### Integration tests
 
@@ -45,7 +78,8 @@ purge**, and say so in the pull request.
 
 - `gofmt`-clean, `go vet`-clean.
 - A test. New parsing or accounting behaviour gets a unit test; anything on the
-  purge or cache path gets an integration test.
+  purge or cache path gets an integration test. If it changes what a run
+  prints, add a step to `scripts/selftest.sh` so the next log shows it.
 - No new runtime dependencies. The binary is static, CGO-free, and shells out to
   nothing — no `btrfs` CLI, no `compsize`. Kernel interfaces are reached through
   ioctls directly, and that stays true.
