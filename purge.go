@@ -397,7 +397,7 @@ func mountPointOf(path string) string {
 	best := ""
 	for _, e := range mounts {
 		mp := filepath.Clean(e.MountPoint)
-		if path != mp && !strings.HasPrefix(path, mp+string(os.PathSeparator)) {
+		if !under(path, mp) {
 			continue
 		}
 		if len(mp) > len(best) {
@@ -405,6 +405,16 @@ func mountPointOf(path string) string {
 		}
 	}
 	return best
+}
+
+// under reports whether path is at or below mountPoint. The root mount is the
+// case worth spelling out: "/" + "/" is not a prefix of anything, so a naive
+// join silently excludes the one mount every path is under.
+func under(path, mountPoint string) bool {
+	if mountPoint == "/" {
+		return strings.HasPrefix(path, "/")
+	}
+	return path == mountPoint || strings.HasPrefix(path, mountPoint+string(os.PathSeparator))
 }
 
 // purgeOneSnapshot unlinks every target inside a single snapshot, holding the

@@ -90,7 +90,34 @@ func TestRequireWritableSnapshotsAcceptsAWritableTree(t *testing.T) {
 	if err := requireWritableSnapshots(plan); err != nil {
 		t.Errorf("requireWritableSnapshots on a writable tree: %v", err)
 	}
-	if mp := mountPointOf(dir); mp == "" {
-		t.Errorf("mountPointOf(%s) = \"\", want the mount it is reached through", dir)
+	// Whatever the layout - a dedicated /tmp, or everything on the root mount,
+	// which is what CI runs on - the path is under some mount and it must be
+	// named, or the error this feeds says nothing the user can act on.
+	mp := mountPointOf(dir)
+	if mp == "" {
+		t.Fatalf("mountPointOf(%s) = \"\", want the mount it is reached through", dir)
+	}
+	if !under(dir, mp) {
+		t.Errorf("mountPointOf(%s) = %q, which does not contain it", dir, mp)
+	}
+}
+
+// Every path is under the root mount, and "/" is the one mount point that a
+// naive prefix join gets wrong.
+func TestUnderHandlesTheRootMount(t *testing.T) {
+	cases := []struct {
+		path, mount string
+		want        bool
+	}{
+		{"/tmp/x/y", "/", true},
+		{"/tmp/x/y", "/tmp", true},
+		{"/tmp/x/y", "/tmp/x/y", true},
+		{"/tmp/xy", "/tmp/x", false},
+		{"/var/tmp", "/tmp", false},
+	}
+	for _, c := range cases {
+		if got := under(c.path, c.mount); got != c.want {
+			t.Errorf("under(%q, %q) = %v, want %v", c.path, c.mount, got, c.want)
+		}
 	}
 }
