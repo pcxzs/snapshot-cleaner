@@ -530,6 +530,7 @@ func cmdScan(args []string) error {
 	folders := fs.Bool("folders", false, "rank whole folders instead of individual files")
 	fileMinSize := fs.String("file-min-size", "0", "with --folders, ignore files smaller than this when adding them up")
 	folderSample := fs.Int("folder-sample", DefaultFolderSample, "with --folders, measure at most this many file copies per folder (0 for all)")
+	maxEntries := fs.Int64("max-entries", DefaultMaxEntries, "stop rather than exhaust memory if a pair holds more than this many file records (negative for no limit)")
 	var excludes multiFlag
 	fs.Var(&excludes, "exclude", "glob to skip; matches a path, a name, or any directory above it (repeatable)")
 	if err := fs.Parse(permuteArgs(fs, args)); err != nil {
@@ -609,6 +610,7 @@ func cmdScan(args []string) error {
 		Folders:         *folders,
 		FolderMinSize:   folderMin,
 		FolderSample:    *folderSample,
+		MaxEntries:      *maxEntries,
 	}
 	if c.gentle && *workers <= 0 {
 		opts.Workers = 2

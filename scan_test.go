@@ -1,9 +1,11 @@
 package main
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -18,6 +20,15 @@ func relPaths(entries []manifestEntry, complete bool, err error) ([]string, bool
 		out = append(out, e.Rel)
 	}
 	return out, complete, err
+}
+
+func counterValue(name string) int64 {
+	logbook.mu.Lock()
+	defer logbook.mu.Unlock()
+	if c, ok := logbook.counters[name]; ok {
+		return c.Load()
+	}
+	return 0
 }
 
 func lstat(t *testing.T, path string) unix.Stat_t {
@@ -265,6 +276,213 @@ func TestScanPairSurvivesUnreadableSnapshot(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Fatal("scanPair deadlocked on unreadable snapshots")
+	}
+}
+
+// The live index has to reach the same conclusions the end-of-pair diff does,
+// because its whole job is to reach them earlier - before the record it is
+// deciding has been retained.
+func TestLiveIndexAgreesWithTheDiff(t *testing.T) {
+	live := manifestEntry{Rel: "a/f", Ino: 7, Size: 100, MtimeNs: 42}
+	x := liveIndex{files: map[string]manifestEntry{"a/f": live}, ok: true}
+
+	differs := live
+	differs.MtimeNs++
+	gone := manifestEntry{Rel: "a/deleted", Ino: 9, Size: 100}
+
+	cases := []struct {
+		name            string
+		entry           manifestEntry
+		includeReplaced bool
+		want            int
+	}{
+		{"identical to live", live, false, dropIdentical},
+		{"identical to live, --include-replaced", live, true, dropIdentical},
+		{"still live but changed", differs, false, dropReplaced},
+		{"still live but changed, --include-replaced", differs, true, keepEntry},
+		{"not live at all", gone, false, keepEntry},
+	}
+	for _, tc := range cases {
+		if got := x.verdict(tc.entry, tc.includeReplaced); got != tc.want {
+			t.Errorf("%s: verdict = %d, want %d", tc.name, got, tc.want)
+		}
+	}
+
+	// An index that could not be built decides nothing, leaving every entry to
+	// the diff exactly as before it existed.
+	var none liveIndex
+	if got := none.verdict(live, false); got != keepEntry {
+		t.Errorf("verdict without an index = %d, want %d", got, keepEntry)
+	}
+}
+
+// A snapshot copy identical to the live file must be dropped as it is walked,
+// not held until the diff at the end of the pair. That is the whole memory
+// argument for the live index, so it is asserted directly rather than inferred
+// from the candidates, which look the same either way.
+func TestScanPairDropsCopiesIdenticalToLiveAsItWalks(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, "live")
+	if err := os.MkdirAll(live, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Hardlinks stand in for reflinks here: same inode, size and mtime, which
+	// is what a snapshot copy of an untouched file looks like.
+	const (
+		untouched = 10
+		snapshots = 3
+	)
+	for i := 0; i < untouched; i++ {
+		name := fmt.Sprintf("untouched%d.bin", i)
+		if err := os.WriteFile(filepath.Join(live, name), make([]byte, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var snaps []Snapshot
+	for s := 0; s < snapshots; s++ {
+		root := filepath.Join(base, fmt.Sprintf("snap%d", s))
+		if err := os.MkdirAll(root, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		for i := 0; i < untouched; i++ {
+			name := fmt.Sprintf("untouched%d.bin", i)
+			if err := os.Link(filepath.Join(live, name), filepath.Join(root, name)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		if err := os.WriteFile(filepath.Join(root, "deleted.bin"), make([]byte, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		snaps = append(snaps, Snapshot{ID: fmt.Sprintf("s%d", s), Root: root})
+	}
+
+	pair := Pair{Name: "test", Live: live, Snapshots: snaps}
+	before := counterValue("walk.identical_to_live")
+	got, err := scanPair(pair, ScanOptions{MinSize: 1, Workers: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dropped := counterValue("walk.identical_to_live") - before; dropped != untouched*snapshots {
+		t.Errorf("dropped %d copies during the walk, want all %d of them",
+			dropped, untouched*snapshots)
+	}
+	if len(got) != 1 || got[0].RelPath != "deleted.bin" || len(got[0].Copies) != snapshots {
+		t.Fatalf("got %+v, want the one deleted file, held by every snapshot", got)
+	}
+}
+
+// The index is not free - it is a whole tree sweep, and the live tree is the
+// one part of a scan that can never be cached - so an ordinary file scan, which
+// retains a few thousand records and diffs them cheaply, must not pay for it.
+func TestLiveIndexIsBuiltOnlyForLowThresholdScans(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, "live")
+	snap := filepath.Join(base, "snap")
+	for _, d := range []string{live, snap} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(snap, "gone.bin"), make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pair := Pair{Name: "test", Live: live, Snapshots: []Snapshot{{ID: "s1", Root: snap}}}
+
+	built := func(opts ScanOptions) int64 {
+		before := counterValue("walk.live_index_built")
+		if _, err := scanPair(pair, opts); err != nil {
+			t.Fatal(err)
+		}
+		return counterValue("walk.live_index_built") - before
+	}
+	if n := built(ScanOptions{MinSize: 50 << 20, Workers: 1}); n != 0 {
+		t.Errorf("a 50 MiB file scan built the live index %d time(s), want 0", n)
+	}
+	if n := built(ScanOptions{MinSize: 0, Workers: 1, Folders: true}); n != 1 {
+		t.Errorf("a folder scan built the live index %d time(s), want 1", n)
+	}
+}
+
+// The other half of that: what is still live but changed is only retained when
+// the scan was asked for it.
+func TestScanPairRetainsReplacedFilesOnlyWhenAsked(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, "live")
+	snap := filepath.Join(base, "snap")
+	for _, d := range []string{live, snap} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(live, "edited.bin"), make([]byte, 2048), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(snap, "edited.bin"), make([]byte, 4096), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	pair := Pair{Name: "test", Live: live, Snapshots: []Snapshot{{ID: "s1", Root: snap}}}
+
+	got, err := scanPair(pair, ScanOptions{MinSize: 1, Workers: 1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("got %+v, want nothing without --include-replaced", got)
+	}
+
+	got, err = scanPair(pair, ScanOptions{MinSize: 1, Workers: 1, IncludeReplaced: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Kind != KindReplaced {
+		t.Fatalf("got %+v, want the replaced file with --include-replaced", got)
+	}
+}
+
+// Running out of memory tells the user nothing about which flag to reach for,
+// so a scan that cannot fit says so while it still can.
+func TestScanPairStopsAtTheEntryBudget(t *testing.T) {
+	base := t.TempDir()
+	live := filepath.Join(base, "live")
+	snap := filepath.Join(base, "snap")
+	for _, d := range []string{live, snap} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 8; i++ {
+		if err := os.WriteFile(filepath.Join(snap, fmt.Sprintf("gone%d.bin", i)), make([]byte, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pair := Pair{Name: "@home", Live: live, Snapshots: []Snapshot{{ID: "s1", Root: snap}}}
+
+	_, err := scanPair(pair, ScanOptions{MinSize: 1, Workers: 1, MaxEntries: 3, Folders: true})
+	if err == nil {
+		t.Fatal("expected the budget to stop the scan")
+	}
+	for _, want := range []string{"@home", "--file-min-size", "--max-entries"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %s", err, want)
+		}
+	}
+
+	// The live index is held for the whole pair, so it counts against the same
+	// ceiling rather than being spent before the ceiling is consulted.
+	for i := 0; i < 8; i++ {
+		if err := os.WriteFile(filepath.Join(live, fmt.Sprintf("here%d.bin", i)), make([]byte, 4096), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	empty := Pair{Name: "@home", Live: live, Snapshots: []Snapshot{{ID: "s1", Root: filepath.Join(base, "none")}}}
+	if _, err := scanPair(empty, ScanOptions{MinSize: 1, Workers: 1, MaxEntries: 3}); err == nil {
+		t.Error("expected a live tree past the budget to stop the scan")
+	}
+
+	// A negative budget is the way out for a machine with the memory to spare.
+	if _, err := scanPair(pair, ScanOptions{MinSize: 1, Workers: 1, MaxEntries: -1}); err != nil {
+		t.Errorf("a negative budget should lift the ceiling, got %v", err)
 	}
 }
 

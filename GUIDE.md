@@ -326,6 +326,7 @@ Finds and ranks pinned files. Read-only. Writes its results to a state file that
 | `--folders` | off | Rank whole directories instead of files. See [§ 7a](#7a-folder-view). |
 | `--file-min-size SIZE` | `0` | With `--folders`, the per-file floor. `--min-size` then applies to the folder. |
 | `--folder-sample N` | `20000` | With `--folders`, the most file copies one folder's measurement will open. `0` measures all. |
+| `--max-entries N` | `8000000` | Stop rather than exhaust memory if one pair holds more than this many file records. Negative removes the ceiling. |
 | `--json` | off | Machine-readable output. |
 
 ```sh
@@ -373,8 +374,9 @@ except for whatever snapshot your manager has taken since.
 
 ### What is not cached
 
-The live filesystem. Every scan re-`lstat`s the live path of every candidate,
-because that is the half that genuinely changes. Deleting and editing files
+The live filesystem. Every scan reads the live side afresh — a walk of the live
+subvolume when the per-file floor is below 1 MiB, an `lstat` per candidate
+otherwise — because that is the half that genuinely changes. Deleting and editing files
 outside this tool is the normal case and works exactly as it did before:
 
 | You do this | What the next scan does |
@@ -421,6 +423,12 @@ buys manifest bytes, not walk time — and it means a later
 An entry is reused only when its floor is at or below the requested
 `--min-size`. Ask for smaller files than the manifest holds and it misses, which
 is correct: the manifest does not contain them.
+
+One manifest is not recorded at all: a walk holding more than two million
+entries, which a folder scan of a large filesystem produces at its zero floor.
+Encoding one costs more memory than the walk that produced it — on every worker
+at once — and writes tens of megabytes per snapshot into a cache whose point is
+to be cheap. Repeating that walk is the cheaper of the two.
 
 ### `cache`
 
@@ -615,9 +623,24 @@ and cache size rather than walk time - the walk visits every file regardless -
 so raise `--file-min-size` if a first scan of a very large filesystem needs
 bounding.
 
+What it does *not* cost is a record per file per snapshot. Whenever the per-file
+floor is below 1 MiB - which folder view is by construction - the live subvolume
+is walked once at the start of each pair, and any snapshot copy still identical
+to its live file - the overwhelming majority on a filesystem that is mostly
+unchanged - is dropped as it is read rather than held until the diff at the end.
+A pair's memory is therefore the live tree plus the candidates, and adding
+snapshots to it barely moves: measured on a synthetic 200,000-file tree, peak
+memory went 444 MB -> 831 MB as the snapshot count went from four to eight
+before this, and 171 MB -> 180 MB after.
+
+`--max-entries` is the backstop. If a pair would hold more records than that
+ceiling, the scan stops and says which flag to reach for; being killed by the
+kernel's OOM reaper halfway through tells you nothing.
+
 Because the per-file floor drops below the cache floor, the first folder scan
 rewalks and records fuller listings than a file scan would. `cache status` will
-show it growing. `--cache-min-size` still controls what gets written.
+show it growing. `--cache-min-size` still controls what gets written, and a
+listing past two million entries is rewalked next time rather than stored.
 
 ### How a folder is measured
 
@@ -977,6 +1000,14 @@ Expected for files rewritten in place. See
 It is bound by btrfs metadata reads. Raise `--min-size`, narrow `--scope`, or
 raise `--workers`. Note that raising workers increases system impact.
 
+**"the scan is holding more than N file record(s)"**
+A pair holds more files than `--max-entries` allows, which on a folder scan of a
+very large filesystem is the zero per-file floor doing what it was asked to.
+Raise `--file-min-size` (a folder of 30 KiB files still rolls up fine at `4K`),
+skip a subtree with `--exclude`, narrow `--scope`, or raise `--max-entries` if
+the machine has the memory. The ceiling exists so the scan fails with advice
+instead of being killed by the OOM reaper with none.
+
 ---
 
 ## 14. If something goes wrong
@@ -1135,8 +1166,10 @@ trusted. Regenerate with a C program including `<linux/btrfs.h>`.
 - **No whole-snapshot deletion**, by design.
 - **`--min-size` hides small files.** Default 50 MB. `--folders` is the answer
   for space held as many small files; see [§ 7a](#7a-folder-view).
-- **A folder scan collects every file**, so it uses considerably more memory and
-  cache than a file scan of the same filesystem. `--file-min-size` bounds it.
+- **A folder scan collects every file**, so it uses more memory and cache than a
+  file scan of the same filesystem — the live tree plus the candidates, rather
+  than a record per file per snapshot. `--file-min-size` bounds it, and
+  `--max-entries` stops a scan that would not fit.
 - **Large folders are measured from a sample**, marked `~`, past
   `--folder-sample` copies. Default 20000.
 - **`--exclude` filters the report, it does not speed up the scan.** The tree

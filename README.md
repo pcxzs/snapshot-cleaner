@@ -132,7 +132,10 @@ In this view `--min-size` is the threshold on the **folder**, and the per-file
 floor drops to `--file-min-size` (default 0, meaning count everything). That is
 what makes the small files visible, and it is the knob to raise if a first scan
 of a very large filesystem needs bounding — it costs walk memory and cache size,
-not much walk time.
+not much walk time. Memory is the live tree plus the candidates, not a record
+per file per snapshot: copies still identical to the live file are dropped as
+they are walked. `--max-entries` stops a scan that would not fit rather than
+letting the kernel kill it.
 
 RECLAIM is still an extent union taken across the whole folder at once, so a
 file reflinked twice inside the same tree is counted once. Folders too large to
@@ -370,8 +373,9 @@ and a purge takes its snapshots' cached listings with it.
 - Whole-snapshot deletion is out of scope; that is what snapshot managers do.
 - Files smaller than `--min-size` (default 50M) are ignored. Use `--folders` to
   rank directories instead, which is what finds space held as many small files.
-- A folder scan collects every file, so it uses considerably more memory and
-  cache than a file scan on the same filesystem. `--file-min-size` bounds it.
+- A folder scan collects every file, so it uses more memory and cache than a
+  file scan on the same filesystem. `--file-min-size` bounds it, and
+  `--max-entries` stops a scan that would not fit in memory.
 - `--exclude` matches the path relative to the subvolume root, the file's own
   name, or any directory above it, so `cache` and `cache/*` both skip the whole
   subtree.

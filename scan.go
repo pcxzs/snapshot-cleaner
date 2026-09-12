@@ -73,6 +73,18 @@ func DefaultWorkers() int {
 	return n
 }
 
+// DefaultMaxEntries bounds how many snapshot file records one pair's scan will
+// hold before it gives up.
+//
+// Folder view walks at a zero floor by default, which on a large home directory
+// means millions of files per snapshot and tens of millions across the pair.
+// Each retained record costs a couple of hundred bytes once its map key and
+// slice are counted, so this ceiling is worth somewhere over a gigabyte: high
+// enough that no ordinary scan meets it, low enough to fail with an explanation
+// while there is still memory to print one. Being killed by the OOM reaper
+// halfway through tells the user nothing about which flag to reach for.
+const DefaultMaxEntries = 8_000_000
+
 // WalkMode selects how a snapshot's file list is obtained.
 type WalkMode int
 
@@ -120,6 +132,11 @@ type ScanOptions struct {
 	// FolderSample bounds the copies one rollup's measurement will open; zero
 	// means DefaultFolderSample.
 	FolderSample int
+
+	// MaxEntries bounds the file records one pair may retain before the scan
+	// fails rather than exhausting memory. Zero means DefaultMaxEntries;
+	// negative removes the ceiling.
+	MaxEntries int64
 }
 
 // ScanResult is what one scan produced. Folders is empty unless the scan asked
@@ -245,9 +262,113 @@ func logCacheStats(c *Cache) {
 // found is one file seen inside one snapshot, whether it was just walked or
 // replayed from the cache. Holding the recorded fields rather than a Stat_t is
 // what lets those two sources be interchangeable.
+//
+// The snapshot is referenced rather than copied. A scan retains one of these
+// per surviving file per snapshot, and an inline Snapshot is 120 bytes of the
+// same half-dozen strings repeated for every one of them; the pointer is 8, and
+// the pair that owns the snapshots outlives the scan reading them.
 type found struct {
-	snapshot Snapshot
+	snapshot *Snapshot
 	entry    manifestEntry
+}
+
+// What the live index says about one snapshot entry.
+const (
+	keepEntry     = iota // the diff at the end of the pair decides it
+	dropIdentical        // a reflink of the live file; frees nothing
+	dropReplaced         // the path is still live, and --include-replaced is off
+)
+
+// liveIndex is the live subvolume's own file list, read once per pair so that
+// the majority of what the snapshot walks turn up can be discarded as it is
+// walked rather than retained and thrown away at the end.
+//
+// Without it a scan's peak memory is the whole filesystem multiplied by the
+// snapshot count: every file of every snapshot is held until the diff, and only
+// then is it discovered that almost none of them are candidates. In folder view
+// - where the per-file floor drops to --file-min-size, zero by default - that
+// is every file on the disk, several times over, which is how a scan of a large
+// home directory gets itself killed by the OOM reaper.
+//
+// Reading the live tree costs one more walk per pair and replaces one lstat per
+// candidate, so it pays for itself on the time as well as on the memory.
+type liveIndex struct {
+	files map[string]manifestEntry
+	ok    bool
+}
+
+// liveIndexFloor is the --min-size below which the index is worth building.
+//
+// It costs one extra tree sweep per pair, and unlike a snapshot's that sweep
+// can never be cached: the live tree is the one thing in a scan that is allowed
+// to change. At the default 50 MiB threshold a pair turns up a few thousand
+// records and the diff at the end is already cheap, so paying a whole walk to
+// make it cheaper would be a straight loss - most visibly on the second scan of
+// a filesystem, where every snapshot comes from the cache and this would be the
+// only walk left. Below a megabyte a pair turns up millions of records instead,
+// and folder view sits at the bottom of that range by construction.
+const liveIndexFloor = 1 << 20
+
+// buildLiveIndex walks the live subvolume. A failure is not fatal: an index
+// that is missing or partial only means its entries fall through to the diff,
+// which is where they were decided before this existed.
+func buildLiveIndex(live string, opts ScanOptions) liveIndex {
+	started := time.Now()
+
+	var (
+		entries []manifestEntry
+		err     error
+	)
+	if opts.Walk == WalkTree {
+		entries, err = treeWalkSnapshot(live, opts.MinSize)
+	} else {
+		var complete bool
+		entries, complete, err = readdirWalk(live, opts.MinSize, nil)
+		if err == nil && !complete {
+			Debugf("scan", "live walk of %s could not read every directory; the index is partial", live)
+		}
+	}
+	if err != nil {
+		Warnf("scan", "cannot walk the live tree %s (%v); scanning without the live index", live, err)
+		return liveIndex{}
+	}
+
+	files := make(map[string]manifestEntry, len(entries))
+	for _, e := range entries {
+		files[e.Rel] = e
+	}
+	Debugf("scan", "live index of %s: %d file(s) at or above %s in %s",
+		live, len(files), FormatBytes(opts.MinSize), time.Since(started).Round(time.Millisecond))
+	Count("walk.live_index_built", 1)
+	Count("walk.live_indexed", int64(len(files)))
+	return liveIndex{files: files, ok: true}
+}
+
+// verdict decides one snapshot entry against the live tree, reaching the same
+// conclusions the diff does and no others.
+//
+// A copy whose inode, size and mtime all match the live file is a reflink of it
+// and frees nothing, exactly as filterDiffering has it. A path that still
+// exists live at all is a replaced row, which the diff drops unless
+// --include-replaced was asked for. Everything else - a path the index has
+// nothing to say about, a live file below the walk floor, a tree it could not
+// read - is kept and decided later, so the index can only ever drop what the
+// diff would have dropped anyway.
+func (x liveIndex) verdict(e manifestEntry, includeReplaced bool) int {
+	if !x.ok {
+		return keepEntry
+	}
+	l, present := x.files[e.Rel]
+	if !present {
+		return keepEntry
+	}
+	if l.Ino == e.Ino && l.Size == e.Size && l.MtimeNs == e.MtimeNs {
+		return dropIdentical
+	}
+	if !includeReplaced {
+		return dropReplaced
+	}
+	return keepEntry
 }
 
 // chooseWalk settles on one walk implementation for the whole run, so the log
@@ -271,13 +392,19 @@ func chooseWalk(pairs []Pair, want WalkMode) WalkMode {
 
 func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 	var (
-		mu      sync.Mutex
-		byPath  = map[string][]found{}
-		scanned atomic.Int64
-		wg      sync.WaitGroup
-		errOnce sync.Once
-		scanErr error
+		mu       sync.Mutex
+		byPath   = map[string][]found{}
+		scanned  atomic.Int64
+		retained atomic.Int64
+		stop     atomic.Bool
+		wg       sync.WaitGroup
+		errOnce  sync.Once
+		scanErr  error
 	)
+	budget := opts.MaxEntries
+	if budget == 0 {
+		budget = DefaultMaxEntries
+	}
 
 	// The cache is keyed per filesystem, so a snapshot UUID recorded for one
 	// filesystem can never be mistaken for the same UUID on another.
@@ -286,7 +413,20 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 		Warnf("scan", "pair %s: cannot read filesystem id (%v); not using the cache", pair.Name, err)
 	}
 
-	jobs := make(chan Snapshot)
+	// Read the live side first, where it is worth reading: what it holds
+	// decides which of the snapshot records that follow are worth keeping in
+	// memory at all. The index counts against the same ceiling as everything
+	// else, so a live tree too large to hold fails here with advice rather than
+	// later without any.
+	var live liveIndex
+	if opts.MinSize < liveIndexFloor {
+		live = buildLiveIndex(pair.Live, opts)
+		if budget > 0 && retained.Add(int64(len(live.files))) > budget {
+			return nil, overBudget(pair, opts, budget)
+		}
+	}
+
+	jobs := make(chan *Snapshot)
 	for w := 0; w < opts.Workers; w++ {
 		wg.Add(1)
 		go func() {
@@ -295,6 +435,9 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 			// in main, and the goroutine must stay on its thread.
 			defer opts.Priority.ApplyToWorker()()
 			for snap := range jobs {
+				if stop.Load() {
+					continue // over budget: drain the channel, do no more work
+				}
 				snapStart := time.Now()
 
 				var (
@@ -302,11 +445,11 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 					hit      bool
 				)
 				if fsID != "" {
-					manifest, hit = opts.Cache.Manifest(fsID, snap, opts.MinSize)
+					manifest, hit = opts.Cache.Manifest(fsID, *snap, opts.MinSize)
 				}
 				if !hit {
 					var err error
-					manifest, err = collectManifest(snap, opts)
+					manifest, err = collectManifest(*snap, opts)
 					if err != nil {
 						// Record the failure but keep draining the channel: a
 						// worker that returns early would leave the sender
@@ -316,7 +459,7 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 						continue
 					}
 					if fsID != "" {
-						opts.Cache.PutManifest(fsID, snap, manifest)
+						opts.Cache.PutManifest(fsID, *snap, manifest)
 					}
 					Count("walk.snapshots", 1)
 				} else {
@@ -327,7 +470,7 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 				// recorded, so one manifest serves scans with different
 				// --min-size and --exclude settings.
 				local := map[string][]found{}
-				var seen int64
+				var seen, identical, replaced int64
 				for _, e := range manifest.Entries {
 					if e.Size < opts.MinSize {
 						continue
@@ -335,16 +478,32 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 					if excluded(e.Rel, filepath.Base(e.Rel), opts.Excludes) {
 						continue
 					}
-					local[e.Rel] = append(local[e.Rel], found{snapshot: snap, entry: e})
 					seen++
-					Tracef("walk", "%s/%s size=%d ino=%d", snap.ID, e.Rel, e.Size, e.Ino)
 					if n := scanned.Add(1); n%20000 == 0 {
 						reportProgress(opts.Progress, pair.Name, n)
 					}
+					switch live.verdict(e, opts.IncludeReplaced) {
+					case dropIdentical:
+						identical++
+						continue
+					case dropReplaced:
+						replaced++
+						continue
+					}
+					local[e.Rel] = append(local[e.Rel], found{snapshot: snap, entry: e})
+					Tracef("walk", "%s/%s size=%d ino=%d", snap.ID, e.Rel, e.Size, e.Ino)
+					if budget > 0 && retained.Add(1) > budget {
+						errOnce.Do(func() { scanErr = overBudget(pair, opts, budget) })
+						stop.Store(true)
+						break
+					}
 				}
-				Debugf("walk", "snapshot %s (%s): %d file(s) at or above threshold in %s (cached=%v)",
-					snap.ID, snap.Root, seen, time.Since(snapStart).Round(time.Millisecond), hit)
+				Debugf("walk", "snapshot %s (%s): %d file(s) at or above threshold in %s (cached=%v), "+
+					"%d identical to live, %d replaced and not asked for",
+					snap.ID, snap.Root, seen, time.Since(snapStart).Round(time.Millisecond), hit, identical, replaced)
 				Count("walk.files_over_threshold", seen)
+				Count("walk.identical_to_live", identical)
+				Count("walk.replaced_skipped", replaced)
 
 				mu.Lock()
 				for rel, fs := range local {
@@ -354,8 +513,8 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 			}
 		}()
 	}
-	for _, s := range pair.Snapshots {
-		jobs <- s
+	for i := range pair.Snapshots {
+		jobs <- &pair.Snapshots[i]
 	}
 	close(jobs)
 	wg.Wait()
@@ -428,6 +587,24 @@ func scanPair(pair Pair, opts ScanOptions) ([]Candidate, error) {
 		out = append(out, cand)
 	}
 	return out, nil
+}
+
+// overBudget explains a scan that would have run the machine out of memory, in
+// terms of the flags that bound it.
+//
+// The ceiling is reported rather than silently applied because the result of
+// applying one would be a half-scanned filesystem presented as a complete
+// answer, and a user acting on a reclaim figure needs to know it is the whole
+// figure.
+func overBudget(pair Pair, opts ScanOptions, budget int64) error {
+	advice := "raise --file-min-size"
+	if !opts.Folders {
+		advice = "raise --min-size"
+	}
+	return fmt.Errorf("pair %s: the scan is holding more than %d file record(s) and would run out "+
+		"of memory before it finished; %s (currently %s), skip a subtree with --exclude, or raise "+
+		"--max-entries if this machine has the memory to spare",
+		pair.Name, budget, advice, FormatBytes(opts.MinSize))
 }
 
 // filterDiffering keeps only the snapshot copies whose content differs from the

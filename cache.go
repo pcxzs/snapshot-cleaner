@@ -54,6 +54,16 @@ const (
 	// scan at a smaller threshold still hits the cache instead of rewalking.
 	DefaultCacheFloor = 1 << 20 // 1 MiB
 
+	// maxCachedManifestEntries bounds the walk result worth recording.
+	//
+	// A folder-view scan walks at a zero floor, so one manifest can be every
+	// file on the filesystem. Encoding that costs more memory than the walk
+	// that produced it - gob stream and gzip buffer both held at once, on every
+	// worker at once - and it writes tens of megabytes per snapshot into a
+	// cache whose point is to be cheap. Past this many entries the walk is
+	// simply repeated next time, which is the cheaper of the two.
+	maxCachedManifestEntries = 2_000_000
+
 	bucketMeta     = "meta"
 	bucketManifest = "manifest"
 	bucketMeasure  = "measure"
@@ -305,6 +315,12 @@ func (c *Cache) PutManifest(fsID string, s Snapshot, blob *manifestBlob) {
 	}
 	if !blob.Complete {
 		Debugf("cache", "snapshot %s walk was incomplete; not cached", s.ID)
+		return
+	}
+	if len(blob.Entries) > maxCachedManifestEntries {
+		Debugf("cache", "snapshot %s walk holds %d entries, past the %d the cache stores; not cached",
+			s.ID, len(blob.Entries), maxCachedManifestEntries)
+		Count("cache.manifest_too_large", 1)
 		return
 	}
 	raw, err := encodeManifest(blob)

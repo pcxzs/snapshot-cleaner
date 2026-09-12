@@ -66,10 +66,18 @@ type dirRef struct {
 // fileRef is one link to a regular file: a file with two hardlinks in the same
 // snapshot occupies one set of extents but appears under two paths, which is
 // exactly what the readdir walk reports too.
+//
+// It carries the inode's size and mtime rather than pointing at a table of
+// them. Items arrive in key order, so a link is always read while its
+// INODE_ITEM is still the current one, and copying sixteen bytes per link costs
+// less than a map of several million inodes - which on a zero-floor folder scan
+// is what this would otherwise be.
 type fileRef struct {
-	ino    uint64
-	parent uint64
-	name   string
+	ino     uint64
+	parent  uint64
+	name    string
+	size    uint64
+	mtimeNs int64
 }
 
 // TreeWalkSupported reports whether the tree-search walk can be used here.
@@ -121,10 +129,11 @@ func treeWalkSnapshot(root string, floor uint64) ([]manifestEntry, error) {
 	var (
 		dirs      = map[uint64]dirRef{}
 		files     []fileRef
-		fileMeta  = map[uint64]manifestEntry{} // ino -> size/mtime, path filled later
 		curIno    uint64
 		curIsDir  bool
 		curIsFile bool
+		curSize   uint64
+		curMtime  int64
 		items     int
 	)
 
@@ -190,9 +199,7 @@ func treeWalkSnapshot(root string, floor uint64) ([]manifestEntry, error) {
 				case unix.S_IFREG:
 					if ii.size >= floor {
 						curIsFile = true
-						fileMeta[hdr.ObjectID] = manifestEntry{
-							Ino: hdr.ObjectID, Size: ii.size, MtimeNs: ii.mtimeNs,
-						}
+						curSize, curMtime = ii.size, ii.mtimeNs
 					}
 				}
 
@@ -209,7 +216,10 @@ func treeWalkSnapshot(root string, floor uint64) ([]manifestEntry, error) {
 						}
 						return
 					}
-					files = append(files, fileRef{ino: hdr.ObjectID, parent: hdr.Offset, name: name})
+					files = append(files, fileRef{
+						ino: hdr.ObjectID, parent: hdr.Offset, name: name,
+						size: curSize, mtimeNs: curMtime,
+					})
 				})
 
 			case btrfsInodeExtrefKey:
@@ -217,7 +227,10 @@ func treeWalkSnapshot(root string, floor uint64) ([]manifestEntry, error) {
 					break
 				}
 				parseInodeExtrefs(item, func(parent uint64, name string) {
-					files = append(files, fileRef{ino: hdr.ObjectID, parent: parent, name: name})
+					files = append(files, fileRef{
+						ino: hdr.ObjectID, parent: parent, name: name,
+						size: curSize, mtimeNs: curMtime,
+					})
 				})
 			}
 			off = itemOff + itemLen
@@ -257,9 +270,12 @@ func treeWalkSnapshot(root string, floor uint64) ([]manifestEntry, error) {
 			Tracef("treewalk", "%s: skipping ino %d, parent %d unresolvable", root, fr.ino, fr.parent)
 			continue
 		}
-		e := fileMeta[fr.ino]
-		e.Rel = filepath.Join(dir, fr.name)
-		out = append(out, e)
+		out = append(out, manifestEntry{
+			Rel:     filepath.Join(dir, fr.name),
+			Ino:     fr.ino,
+			Size:    fr.size,
+			MtimeNs: fr.mtimeNs,
+		})
 	}
 	return out, nil
 }
