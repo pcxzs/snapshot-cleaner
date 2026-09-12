@@ -45,11 +45,24 @@ func (m *Mounter) TopLevel(device string, mounts []MountEntry) (string, error) {
 
 	// A mount whose in-filesystem root is "/" already exposes the top level.
 	for _, e := range mounts {
-		if e.FSType == "btrfs" && e.Source == device && e.Root == "/" {
-			m.reused[device] = e.MountPoint
-			Debugf("mount", "reusing existing top-level mount of %s at %s", device, e.MountPoint)
+		if e.FSType != "btrfs" || e.Source != device || e.Root != "/" {
+			continue
+		}
+		if m.owns(e.MountPoint) {
+			// One of ours, from a run that was killed before it could clean
+			// up - the lock means it cannot be a live one. Adopting it rather
+			// than treating it as the system's is what lets purge make it
+			// writable and cleanup unmount it: a stale read-only mount is
+			// otherwise inherited by every later run, and a purge through it
+			// fails on every single file.
+			m.created[device] = e.MountPoint
+			Warnf("mount", "adopting %s, a top-level mount of %s left behind by an earlier run",
+				e.MountPoint, device)
 			return e.MountPoint, nil
 		}
+		m.reused[device] = e.MountPoint
+		Debugf("mount", "reusing existing top-level mount of %s at %s", device, e.MountPoint)
+		return e.MountPoint, nil
 	}
 
 	if os.Geteuid() != 0 {
@@ -106,6 +119,18 @@ func (m *Mounter) Remount(mountPoint string, readOnly bool) error {
 	return nil
 }
 
+// owns reports whether a mount point is inside this tool's own mount root, and
+// therefore ours to remount and to unmount whichever run put it there. Nothing
+// else has any business mounting under <runtime-dir>/mnt.
+func (m *Mounter) owns(mountPoint string) bool {
+	if m.root == "" {
+		return false
+	}
+	root := filepath.Clean(m.root)
+	mp := filepath.Clean(mountPoint)
+	return mp != root && strings.HasPrefix(mp, root+string(os.PathSeparator))
+}
+
 // Cleanup unmounts everything this process mounted. Safe to call more than
 // once, which matters because it runs from both a deferred call and the signal
 // handler.
@@ -146,9 +171,9 @@ func (m *Mounter) MountedPaths() []string {
 	return out
 }
 
-// OwnedMountFor returns the mount point this process created that contains
-// path, or "" when path is reached through a mount we do not own. Purge uses it
-// to know which mount needs to be made writable.
+// OwnedMountFor returns the mount point this tool owns that contains path, or
+// "" when path is reached through a mount we do not own. Purge uses it to know
+// which mounts need to be made writable.
 func (m *Mounter) OwnedMountFor(path string) string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -159,4 +184,26 @@ func (m *Mounter) OwnedMountFor(path string) string {
 		}
 	}
 	return ""
+}
+
+// OwnedMountsFor returns every mount this tool owns that holds one of paths.
+//
+// A plan can span two pairs on two filesystems, and each has its own top-level
+// mount; making only the first one writable would leave the second failing
+// every unlink. Order follows the paths, so the caller remounts them in a
+// deterministic order.
+func (m *Mounter) OwnedMountsFor(paths []string) []string {
+	var (
+		out  []string
+		seen = map[string]bool{}
+	)
+	for _, p := range paths {
+		mp := m.OwnedMountFor(p)
+		if mp == "" || seen[mp] {
+			continue
+		}
+		seen[mp] = true
+		out = append(out, mp)
+	}
+	return out
 }

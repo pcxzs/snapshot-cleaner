@@ -272,9 +272,10 @@ type Purger struct {
 	Journal *Journal
 	Out     io.Writer
 	Mounter *Mounter
-	// MountPoint is the mount this tool created that must be writable during
-	// the purge; empty when the snapshots are reached through a system mount.
-	MountPoint string
+	// MountPoints are the mounts this tool owns that must be writable during
+	// the purge, one per filesystem the plan touches. Empty when the snapshots
+	// are reached through mounts belonging to the system.
+	MountPoints []string
 }
 
 // Execute performs the removals. Every snapshot it makes writable is restored
@@ -285,12 +286,12 @@ func (p *Purger) Execute(plan *PurgePlan) (reclaimed int, err error) {
 		return 0, nil
 	}
 
-	Infof("purge", "executing: %d target(s) across %d snapshot(s), mountpoint=%q",
-		len(plan.Targets), countSnapshots(plan), p.MountPoint)
+	Infof("purge", "executing: %d target(s) across %d snapshot(s), mountpoints=%q",
+		len(plan.Targets), countSnapshots(plan), p.MountPoints)
 
-	if p.MountPoint != "" {
-		if err := p.Mounter.Remount(p.MountPoint, false); err != nil {
-			Errorf("purge", "could not make %s writable: %v", p.MountPoint, err)
+	for _, mp := range p.MountPoints {
+		if err := p.Mounter.Remount(mp, false); err != nil {
+			Errorf("purge", "could not make %s writable: %v", mp, err)
 			return 0, fmt.Errorf("making snapshots writable: %w", err)
 		}
 		defer func() {
@@ -301,11 +302,19 @@ func (p *Purger) Execute(plan *PurgePlan) (reclaimed int, err error) {
 			// by cleanup, so failing to restore the flag changes nothing -
 			// reporting it as an error would make a successful purge look
 			// like it failed.
-			if rerr := p.Mounter.Remount(p.MountPoint, true); rerr != nil {
+			if rerr := p.Mounter.Remount(mp, true); rerr != nil {
 				Debugf("purge", "could not restore read-only on our own mount %s: %v "+
-					"(harmless; it is unmounted next)", p.MountPoint, rerr)
+					"(harmless; it is unmounted next)", mp, rerr)
 			}
 		}()
+	}
+
+	// Whatever the mounts were, the snapshots have to be writable now. Finding
+	// out one file at a time is the difference between one sentence and several
+	// hundred thousand identical errors.
+	if err := requireWritableSnapshots(plan); err != nil {
+		Errorf("purge", "%v", err)
+		return 0, err
 	}
 
 	bySnapshot := map[string][]PurgeTarget{}
@@ -338,6 +347,64 @@ func (p *Purger) Execute(plan *PurgePlan) (reclaimed int, err error) {
 	}
 	Infof("purge", "removed %d file copy/copies successfully", reclaimed)
 	return reclaimed, nil
+}
+
+// requireWritableSnapshots refuses a purge that every unlink would fail.
+//
+// The snapshots are normally reached through a mount this tool owns, which
+// Execute has just made writable. A mount belonging to the system is another
+// matter: remounting someone else's mount is not this tool's to do, so if that
+// one is read-only the purge cannot proceed at all. The same goes for a
+// filesystem mounted read-only after some earlier error.
+//
+// The read-only *subvolume* flag is not what this looks at - purgeOneSnapshot
+// clears and restores that per snapshot. This is the mount underneath it.
+func requireWritableSnapshots(plan *PurgePlan) error {
+	seen := map[string]bool{}
+	for _, t := range plan.Targets {
+		root := t.Copy.Snapshot
+		if seen[root] {
+			continue
+		}
+		seen[root] = true
+
+		var st unix.Statfs_t
+		if err := unix.Statfs(root, &st); err != nil {
+			return fmt.Errorf("checking whether %s can be written to: %w", root, err)
+		}
+		if st.Flags&unix.ST_RDONLY == 0 {
+			continue
+		}
+		where := root
+		if mp := mountPointOf(root); mp != "" {
+			where = mp
+		}
+		return fmt.Errorf("%s is on a read-only mount (%s) that this run does not own, so nothing "+
+			"could be removed; unmount it if it was left behind by an earlier run, or remount it "+
+			"read-write, then purge again", root, where)
+	}
+	return nil
+}
+
+// mountPointOf names the mount a path is reached through, for an error message
+// that can be acted on. It is best effort: an unreadable mount table only costs
+// the message its detail.
+func mountPointOf(path string) string {
+	mounts, err := ReadMounts()
+	if err != nil {
+		return ""
+	}
+	best := ""
+	for _, e := range mounts {
+		mp := filepath.Clean(e.MountPoint)
+		if path != mp && !strings.HasPrefix(path, mp+string(os.PathSeparator)) {
+			continue
+		}
+		if len(mp) > len(best) {
+			best = mp
+		}
+	}
+	return best
 }
 
 // purgeOneSnapshot unlinks every target inside a single snapshot, holding the

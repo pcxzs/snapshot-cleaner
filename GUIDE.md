@@ -1000,6 +1000,13 @@ Expected for files rewritten in place. See
 It is bound by btrfs metadata reads. Raise `--min-size`, narrow `--scope`, or
 raise `--workers`. Note that raising workers increases system impact.
 
+**Every removal fails with "unlink: read-only file system"**
+The snapshots are being reached through a read-only mount that this run does not
+own, so it cannot be made writable. A purge now refuses up front with the mount
+named rather than failing file by file. A mount under `<runtime-dir>/mnt/` is
+adopted automatically; any other one is the system's, so unmount it or remount
+it read-write and purge again.
+
 **"the scan is holding more than N file record(s)"**
 A pair holds more files than `--max-entries` allows, which on a folder scan of a
 very large filesystem is the zero per-file floor doing what it was asked to.
@@ -1026,14 +1033,20 @@ repair, and the tool prints the exact path.
 ### A stale mount was left behind
 
 Mounts live under `<runtime-dir>/mnt/` and are removed on exit, including on
-Ctrl-C. If one survives a hard kill:
+Ctrl-C. One can still survive a hard kill — an OOM kill, `kill -9`, a power cut.
+
+The next run adopts it: a mount under this tool's own mount root belongs to this
+tool whichever run made it, and the lock file means it cannot belong to a live
+one. It is reused for reading, made writable for a purge like any mount of our
+own, and unmounted on exit. Nothing is needed from you.
+
+It is a read-only mount until a purge needs otherwise, so nothing can have been
+damaged through it. To remove one by hand anyway:
 
 ```sh
 mount | grep snapshot-cleaner
 sudo umount /run/snapshot-cleaner/mnt/top-XXXXXX
 ```
-
-It is a read-only mount, so nothing can have been damaged through it.
 
 ### You purged something you needed
 

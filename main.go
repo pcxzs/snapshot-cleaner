@@ -831,11 +831,15 @@ func cmdPurge(args []string) error {
 	defer journal.Close()
 
 	freeBefore, _ := FreeBytes(st.Pairs[0].Live)
+	targetPaths := make([]string, 0, len(plan.Targets))
+	for _, t := range plan.Targets {
+		targetPaths = append(targetPaths, t.Copy.Path)
+	}
 	purger := &Purger{
-		Journal:    journal,
-		Out:        os.Stdout,
-		Mounter:    a.mounter,
-		MountPoint: a.mounter.OwnedMountFor(plan.Targets[0].Copy.Path),
+		Journal:     journal,
+		Out:         os.Stdout,
+		Mounter:     a.mounter,
+		MountPoints: a.mounter.OwnedMountsFor(targetPaths),
 	}
 
 	fmt.Println()
